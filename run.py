@@ -107,7 +107,8 @@ def run(args):
         if required - available:
             raise ValueError(f"Experiment {args.exp} needs: {', '.join(sorted(required - available))}")
     if not pairs:
-        raise ValueError("No pair data found. Pass JSONL files or set --dataset-dir.")
+        raise ValueError("No pair JSONL data found. Address CSV inventories are not experiment pairs; "
+                         "provide the frozen datasets described in README or run --exp smoke.")
     validate_pairs(pairs)
     # print("evaluation inputs:", len(pairs), "sources:", [path.name for path in sources])
     # print("mutation labels:", [row.get("label") for row in pairs if row["dataset"] == "mut"][:20])
@@ -141,6 +142,10 @@ def main():
     parser.add_argument("--cost-samples", type=int, default=500)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--details", action="store_true", help="Also save pair scores, selected inputs, and per-pair diagnostics")
+    parser.add_argument("--strict-paper", action="store_true",
+                        help="Fail after saving diagnostics unless paper table inputs and provenance are complete")
+    parser.add_argument("--artifact-manifest", type=Path,
+                        help="JSON manifest of frozen split, training, checkpoint and replay artifacts with SHA256 hashes")
     parser.add_argument("--solc-dir", type=Path)
     parser.add_argument("--legacy-version", default="0.5.17")
     parser.add_argument("--smoke-mutation", choices=MUTATIONS, default="CH",

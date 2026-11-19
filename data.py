@@ -1,6 +1,8 @@
 
 
 import json
+from datetime import datetime, timezone
+from hashlib import sha256
 from copy import deepcopy
 
 #  from pyevmasm import disassemble_all
@@ -21,6 +23,7 @@ VERSIONS = ("0.5.17", "0.6.12", "0.7.6", "0.8.19", "0.8.20")
 MUTATIONS = ("CH", "SH", "RS", "PT", "ET")
 DATASETS = {"opt", "ver", "mut", "noise", "llm", "calibration", "mixed", "temporal"}
 NOISE_TYPES = ("metadata", "junk", "deadcode", "combined")
+TEMPORAL_CUTOFF = datetime(2023, 10, 1, tzinfo=timezone.utc)
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -55,21 +58,63 @@ def load_pairs(paths: list[Path]) -> list[dict]:
     return validate_pairs(pairs)
 
 
+def bytecode_fingerprint(code) -> str:
+    """Identity evidence independent of filenames, hex case and solc metadata."""
+    return sha256(strip_metadata(code)).hexdigest()
+
+
+def temporal_provenance(row: dict) -> dict:
+    """Validate supplied deployment claims; this does not query a chain node."""
+    deployment = row.get("deployment", {})
+    if not isinstance(deployment, dict):
+        raise ValueError(f"{row['id']}: deployment must be an object")
+    timestamp = deployment.get("timestamp", row.get("deployed_at"))
+    evidence = deployment.get("evidence", row.get("deployment_evidence"))
+    block = deployment.get("block_number", row.get("deployment_block"))
+    if evidence is not None and (not isinstance(evidence, str) or not evidence.strip()):
+        raise ValueError(f"{row['id']}: deployment evidence must be a nonempty reference string")
+    if timestamp is not None:
+        try:
+            parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(f"{row['id']}: deployment timestamp must use ISO 8601") from error
+        if parsed.tzinfo is None or parsed < TEMPORAL_CUTOFF:
+            raise ValueError(f"{row['id']}: temporal deployment must be timezone-aware and on/after 2023-10-01")
+    if block is not None and (type(block) is not int or block < 0):
+        raise ValueError(f"{row['id']}: deployment block must be a nonnegative integer")
+    corpora = row.get("source_corpora", [])
+    if not isinstance(corpora, list) or any(not isinstance(name, str) for name in corpora):
+        raise ValueError(f"{row['id']}: source_corpora must be a list of corpus names")
+    original = {"smartbugs", "smartbugs2.0", "scrawid", "scrawld"}
+    if any(name.lower().replace(" ", "") in original for name in corpora):
+        raise ValueError(f"{row['id']}: temporal sample is declared part of an original corpus")
+    return {"deployment_claim_complete": timestamp is not None and block is not None and bool(evidence),
+            "independent_chain_verification": False,
+            "cutoff": TEMPORAL_CUTOFF.isoformat()}
+
+
 def validate_pairs(pairs: list[dict]) -> list[dict]:
     seen = set()
     attempts = set()
     partitions = {}
+    fingerprints = {}
     for row in pairs:
         key, dataset = row["id"], row["dataset"]
         # print("validate:", key, dataset, row.get("label"), row.get("mutation"))
         if key in seen or dataset not in DATASETS:
             raise ValueError(f"Duplicate pair identifier or unknown dataset: {key}, {dataset}")
         seen.add(key)
-        contract = row["contract_id"].lower()
-        partition = dataset if dataset in {"calibration", "mixed"} else "test"
+        if not isinstance(row["contract_id"], str) or not row["contract_id"].strip():
+            raise ValueError(f"{key}: contract_id must be a nonempty string")
+        contract = row["contract_id"].strip().lower()
+        # Old: temporal was grouped with the original evaluation data, allowing
+        # the same contract into both the original corpus and temporal holdout.
+        partition = dataset if dataset in {"calibration", "mixed", "temporal"} else "test"
         # print("contract partition:", contract, partition, "previous:", partitions.get(contract))
         if partitions.setdefault(contract, partition) != partition:
-            raise ValueError(f"{contract} occurs in both training/calibration and evaluation subsets")
+            raise ValueError(f"{contract} occurs in incompatible subsets: {partitions[contract]} and {partition}")
+        if dataset == "temporal":
+            temporal_provenance(row)
         if dataset in {"mut", "temporal", "mixed"} and row.get("label") not in (0, 1):
             raise ValueError(f"{key} needs label=1 (equivalent) or label=0 (mutated)")
         if dataset == "calibration" and row.get("label", 1) != 1:
@@ -82,13 +127,31 @@ def validate_pairs(pairs: list[dict]) -> list[dict]:
                 raise ValueError(f"{key} needs a unique contract/model attempt with status success or failed")
             attempts.add((contract, model))
             if status == "failed":
-                continue
+                # Failed attempts may retain a usable reference; never require
+                # a generated runtime that the model failed to produce.
+                fields = ("a",) if row.get("a") else ()
+            else:
+                fields = ("a", "b")
+        else:
+            fields = ("a", "b")
         if dataset == "noise" and (row.get("noise") not in NOISE_TYPES or not bytecode_bytes(row["clean_b"])):
             raise ValueError(f"{key} needs a noise type and nonempty clean_b")
-        for field in ("a", "b"):
+        for field in fields:
             # print("bytecode field:", key, field, "bytes:", len(bytecode_bytes(row[field])))
             if not bytecode_bytes(row[field]):
                 raise ValueError(f"{key} has empty runtime bytecode in {field}")
+        # Old isolation used only caller-supplied contract IDs. Filename-derived
+        # legacy IDs could hide an identical bytecode in another partition.
+        # Smoke fixtures deliberately reuse tiny bytecodes and are explicitly
+        # synthetic; publication checks must exclude this origin entirely.
+        if row.get("sample_origin") != "smoke":
+            identity_fields = (*fields, *(("clean_b",) if dataset == "noise" else ()))
+            for field in identity_fields:
+                fingerprint = bytecode_fingerprint(row[field])
+                previous = fingerprints.setdefault(fingerprint, (partition, key))
+                if previous[0] != partition:
+                    raise ValueError(f"{key}: normalized bytecode overlaps {previous[1]} across "
+                                     f"{previous[0]}/{partition} subsets")
     # print("validated IDs:", len(seen), "contracts:", len(partitions), "LLM attempts:", len(attempts))
     return pairs
 
@@ -263,7 +326,8 @@ def prepare_mutants(recipes: list[dict], root: Path, solc_dir: Path | None) -> t
             # print("runtime differs after metadata removal:", recipe["id"])
             pairs.append(pair(dataset, spec["id"], recipe["id"], original.bytecode, changed.bytecode,
                               label=0, mutation=kind, version=version, evidence="operator_and_abi",
-                              **{key: recipe[key] for key in ("traceability", "difficulty") if key in recipe}))
+                              **{key: recipe[key] for key in ("traceability", "difficulty", "generator", "variant",
+                                                            "requires_differential_confirmation") if key in recipe}))
         except (OSError, SolcError, ValueError, KeyError) as error:
             failures.append({"id": recipe["id"], "mutation": kind, "error": str(error)})
             # print("mutation rejected:", recipe["id"], kind, str(error)[:200])
@@ -359,7 +423,9 @@ def legacy_pair(row, dataset, path, number):
     contract = str(row.get("contract_id") or row.get("address") or "").strip().lower()
     fallback = contract in {"", "unknown", "?"}
     if fallback:
-        contract = f"legacy:{path.stem}:{row.get('pair_id', number)}"
+        # Old: filename/line identity could hide the same contract across splits.
+        # A failed attempt without reference bytecode remains explicitly unknown.
+        contract = f"legacy:unresolved:{path.stem}:{row.get('pair_id', number)}"
 
     fields = {}
     suffix = row.get("pair_id", number)
@@ -395,7 +461,11 @@ def legacy_pair(row, dataset, path, number):
     else:
         raise ValueError("Unrecognized bytecode fields")
 
-    for key in ("traceability", "difficulty", "sample_origin", "category"):
+    if fallback and a:
+        contract = f"legacy:runtime:{bytecode_fingerprint(a)}"
+    for key in ("traceability", "difficulty", "sample_origin", "category",
+                "function_event_matches", "deployment", "deployed_at", "deployment_evidence",
+                "deployment_block", "source_corpora"):
         if key in row:
             fields[key] = row[key]
     result = pair(dataset, contract, str(suffix), a, b, **fields)

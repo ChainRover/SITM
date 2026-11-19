@@ -12,6 +12,7 @@ from data import read_jsonl, write_jsonl
 from measurements import field_traceability, measure_cost, noise_correlations
 from mutations import verify_replays
 from tables import clear_previous_reports, core_coverage, save_core_tables, save_experiment_tables, save_table
+from reproducibility import artifact_input_paths, execution_provenance, paper_readiness
 
 
 def json_file(path, value):
@@ -78,6 +79,16 @@ def evaluate(pairs, args, sources):
             calibration["gate_at_published_alpha"] = fit_gate(mixed)
 
     summary = summarize(pairs, rows, args.threshold, args.bootstrap, args.seed)
+    temporal_profiles = {}
+    for row in pairs:
+        if row["dataset"] == "temporal":
+            profile = temporal_profiles.setdefault(row["contract_id"].strip().lower(), Counter())
+            profile[row["label"]] += 1
+    summary["temporal_design"] = {
+        "contracts": len(temporal_profiles),
+        "one_positive_two_negative_per_contract": bool(temporal_profiles) and all(
+            profile == Counter({1: 1, 0: 2}) for profile in temporal_profiles.values()),
+    }
     # print("summary sections:", sorted(summary))
     # print("threshold / bootstrap / seed:", args.threshold, args.bootstrap, args.seed)
     summary["calibration"] = calibration
@@ -89,8 +100,16 @@ def evaluate(pairs, args, sources):
     }
     summary["pairs_without_address"] = sum("contract_id_source" in row for row in pairs)
     summary["sample_origins"] = dict(Counter(row.get("sample_origin", "provided") for row in pairs))
+    summary["execution"] = execution_provenance()
+    summary["field_traceability_definition"] = {
+        "manuscript_column": "pair_rate", "denominator": "all supplied Opt-Pair reference bytecodes",
+        "known": "at least one non-DYN applicable event field in the reference bytecode",
+        "event_rate": "separate diagnostic with applicable events as denominator",
+    }
     summary["input_files"] = []
-    for path in dict.fromkeys([*sources, *args.scores, *args.replays]):
+    artifact_manifest = getattr(args, "artifact_manifest", None)
+    evidence_sources = [artifact_manifest] if artifact_manifest is not None else []
+    for path in dict.fromkeys([*sources, *args.scores, *args.replays, *evidence_sources]):
         summary["input_files"].append({"name": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     summary["dependencies"] = {}
     for name in ("py-solc-x", "numpy", "scipy", "scikit-learn", "networkx", "cbor2", "rapidfuzz"):
@@ -124,7 +143,8 @@ def evaluate(pairs, args, sources):
         summary["rq3_mut"]["differential_replay"] = validation
 
     args.out.mkdir(parents=True, exist_ok=True)
-    clear_previous_reports(args.out, [*sources, *args.scores, *args.replays])
+    clear_previous_reports(args.out, [*sources, *args.scores, *args.replays,
+                                     *artifact_input_paths(artifact_manifest)])
     opt = [row for row in pairs if row["dataset"] == "opt"]
     if args.exp in {"all", "core", "smoke", "6"} and opt:
         summary["cost"] = measure_cost(opt, args.cost_samples, args.warmup, args.seed, args.out, args.details)
@@ -137,6 +157,7 @@ def evaluate(pairs, args, sources):
     save_experiment_tables(summary, args.out, args.details)
     save_core_tables(summary, args.out, args.details)
     summary["table_coverage"] = core_coverage(summary, args.out)
+    summary["paper_readiness"] = paper_readiness(summary, pairs, rows, artifact_manifest)
     # for item in summary["table_coverage"]:
     #     print("table coverage:", item)
     save_table(args.out / "table_status.csv", summary["table_coverage"])
@@ -159,4 +180,7 @@ def evaluate(pairs, args, sources):
     print(f"{args.out}: evaluated {len(rows)} pairs")
     print(f"Dataset counts: {summary['counts']}")
     print(f"Table coverage: {args.out / 'table_status.csv'}")
+    print(f"Paper artifact readiness: {summary['paper_readiness']['ready']}")
+    if getattr(args, "strict_paper", False) and not summary["paper_readiness"]["ready"]:
+        raise ValueError("Paper reproduction evidence is incomplete; see summary.json paper_readiness.issues")
     return summary

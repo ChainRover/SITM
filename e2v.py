@@ -5,16 +5,55 @@ from pathlib import Path
 from random import Random
 
 from evm_sit import bytecode_bytes, disassemble, strip_metadata
-from model_scores import score_file
+from model_scores import artifact_hashes, bytecode_id, file_sha256, score_file
 from data import build, read_jsonl, standard_input, write_jsonl
 
 
 MAX_LENGTH = 512
 SPECIAL = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+REPRESENTATIONS = ("opcode-only", "operand-bytes")
+BYTE_TOKENS = [f"IMM_{value:02x}" for value in range(256)]
 
 
-def opcode_text(code):
-    return " ".join(ins.name for ins in disassemble(bytecode_bytes(code))[:MAX_LENGTH - 2])
+def opcode_text(code, representation="opcode-only", *, strip_meta=True):
+    """Encode the published opcode baseline or an explicitly separate variant.
+
+    Opcode-only intentionally discards PUSH values, so it cannot distinguish
+    same-width immediate-only PT mutations. Operand bytes require retraining.
+    """
+    if representation not in REPRESENTATIONS:
+        raise ValueError(f"Unknown E2V representation: {representation}")
+    tokens = []
+    normalized = strip_metadata(code) if strip_meta else bytecode_bytes(code)
+    for ins in disassemble(normalized):
+        tokens.append(ins.name)
+        if representation == "operand-bytes" and ins.name.startswith("PUSH") and ins.name != "PUSH0":
+            width = int(ins.name[4:])
+            tokens.extend(f"IMM_{value:02x}" for value in ins.immediate.to_bytes(width, "big"))
+        if len(tokens) >= MAX_LENGTH - 2:
+            break
+    return " ".join(tokens[:MAX_LENGTH - 2])
+
+
+def model_representation(directory, requested=None):
+    path = Path(directory) / "representation.json"
+    if path.is_file():
+        archived = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(archived, dict):
+            raise ValueError(f"Expected an object in E2V representation manifest: {path}")
+        representation = archived.get("representation")
+        if representation not in REPRESENTATIONS or archived.get("max_length") != MAX_LENGTH:
+            raise ValueError(f"Unsupported E2V representation manifest: {path}")
+        if archived.get("preprocessing") != "solidity_cbor_metadata_stripped":
+            raise ValueError(f"Unsupported E2V preprocessing manifest: {path}")
+        status = "archived"
+    else:
+        # Legacy checkpoints had no representation manifest. They can only be
+        # interpreted as the old opcode-only baseline, never the new variant.
+        representation, status = "opcode-only", "legacy_assumed_opcode_only"
+    if requested is not None and requested != representation:
+        raise ValueError(f"Checkpoint uses {representation}, requested {requested}; retrain the requested representation")
+    return representation, status
 
 
 def prepare_data(args):
@@ -45,6 +84,7 @@ def train_model(args):
     from transformers import DataCollatorForLanguageModeling, DebertaV2Config
     from transformers import DebertaV2ForMaskedLM, PreTrainedTokenizerFast
 
+    representation = getattr(args, "representation", "opcode-only")
     texts = []
     seen = set()
     tokens = set()
@@ -53,7 +93,7 @@ def train_model(args):
         if row.get("split") != "train" or identifier in seen:
             raise ValueError(f"Expected a unique train contract: {identifier}")
         seen.add(identifier)
-        text = opcode_text(strip_metadata(row["bytecode"]))
+        text = opcode_text(row["bytecode"], representation)
         # if len(texts) < 3:
         #     print("training contract:", identifier, "opcode tokens:", len(text.split()))
         if text:
@@ -61,6 +101,10 @@ def train_model(args):
             tokens.update(text.split())
     if not texts:
         raise ValueError("No opcodes in the training corpus")
+    if representation == "operand-bytes":
+        # A fixed byte alphabet retains unseen immediates instead of mapping
+        # every unseen PUSH value to [UNK]. This is a new trained baseline.
+        tokens.update(BYTE_TOKENS)
     vocabulary = SPECIAL + sorted(tokens)
     # print("training contracts:", len(texts), "unique contracts:", len(seen))
     # print("vocabulary:", len(vocabulary), "special tokens:", SPECIAL)
@@ -80,6 +124,7 @@ def train_model(args):
         intermediate_size=768, max_position_embeddings=MAX_LENGTH, pad_token_id=vocab["[PAD]"],
         relative_attention=True, pos_att_type=["p2c", "c2p"], share_att_key=True,
     )).to(args.device)
+    model.config.sitm_representation = representation
     collator = DataCollatorForLanguageModeling(tokenizer, mlm_probability=0.15)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     rng = Random(args.seed)
@@ -113,13 +158,21 @@ def train_model(args):
         raise ValueError("No masked tokens were sampled. Use more training bytecode or more epochs.")
     model.save_pretrained(args.output)
     tokenizer.save_pretrained(args.output)
+    manifest = {"schema_version": 1, "representation": representation, "max_length": MAX_LENGTH,
+                "preprocessing": "solidity_cbor_metadata_stripped"}
+    (args.output / "representation.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     details = {"training": "local_mlm", "seed": args.seed, "epochs": args.epochs,
                "batch_size": args.batch_size, "learning_rate": args.learning_rate,
-               "training_contracts": len(texts), "optimizer_steps": updates}
+               "training_contracts": len(texts), "optimizer_steps": updates,
+               "representation": representation, "train_manifest_sha256": file_sha256(args.train_data),
+               "training_code_sha256": file_sha256(Path(__file__)),
+               "training_contract_ids_sha256": bytecode_id("\n".join(sorted(seen)).encode()),
+               "training_text_sha256": bytecode_id("\n".join(texts).encode())}
     (args.output / "training.json").write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
 
 
 def score_model(args):
+    representation, representation_status = model_representation(args.model, getattr(args, "representation", None))
     import torch
     from torch.nn.functional import cosine_similarity
     from transformers import AutoModel, AutoTokenizer
@@ -132,11 +185,18 @@ def score_model(args):
     # print("encoder type / hidden size:", model.config.model_type, model.config.hidden_size)
     if loading["missing_keys"] or model.config.model_type != "deberta-v2" or model.config.hidden_size != 768:
         raise ValueError("Expected a complete DeBERTa-v2 encoder with 768-dimensional vectors")
+    configured = getattr(model.config, "sitm_representation", "opcode-only")
+    if configured != representation:
+        raise ValueError("Saved model configuration and representation manifest disagree; retrain the requested representation")
+    if representation == "operand-bytes" and not set(BYTE_TOKENS) <= tokenizer.get_vocab().keys():
+        raise ValueError("Operand-aware checkpoint must contain all 256 immediate-byte tokens")
     model.to(args.device).eval()
 
     @lru_cache(maxsize=512)
     def embed(code):
-        inputs = tokenizer(opcode_text(code), return_tensors="pt", truncation=True, max_length=MAX_LENGTH)
+        # score_file already applied the single shared preprocessing pass.
+        inputs = tokenizer(opcode_text(code, representation, strip_meta=False), return_tensors="pt",
+                           truncation=True, max_length=MAX_LENGTH)
         inputs = inputs.to(args.device)
         # print("encoded tokens:", tokenizer.convert_ids_to_tokens(inputs["input_ids"][0].tolist())[:30])
         # print("attention tokens:", int(inputs["attention_mask"].sum()), "pooling:", args.pooling)
@@ -159,13 +219,27 @@ def score_model(args):
             return vector.cpu()
 
     def similarity(a, b):
-        return float(cosine_similarity(embed(a), embed(b), dim=0))
+        # Roundoff can otherwise report 1.0000001 for identical vectors.
+        return float(cosine_similarity(embed(a), embed(b), dim=0).clamp(-1.0, 1.0))
 
-    details = {"checkpoint": args.model.name, "pooling": args.pooling, "max_length": MAX_LENGTH}
+    details = {"checkpoint": args.model.name, "pooling": args.pooling, "max_length": MAX_LENGTH,
+               "checkpoint_files_sha256": artifact_hashes(args.model),
+               "representation": representation, "representation_status": representation_status,
+               "scoring_code_sha256": file_sha256(Path(__file__)),
+               "training_provenance": {"status": "unprovided"}}
     training = args.model / "training.json"
     if training.is_file():
-        details.update(json.loads(training.read_text(encoding="utf-8")))
-    score_file(args.inputs, args.output, "E2V", similarity, details)
+        archived = json.loads(training.read_text(encoding="utf-8"))
+        if not isinstance(archived, dict):
+            raise ValueError("Expected an object in E2V training metadata")
+        if archived.get("representation", "opcode-only") != representation:
+            raise ValueError("Training metadata and checkpoint representation disagree")
+        details["training_provenance"] = {"status": "archived_metadata", "file_sha256": file_sha256(training),
+                                          "metadata": archived}
+    method = "E2V" if representation == "opcode-only" else "E2V_operand"
+    diagnostics = lambda a, b: {"identical_model_inputs": opcode_text(a, representation, strip_meta=False)
+                               == opcode_text(b, representation, strip_meta=False)}
+    score_file(args.inputs, args.output, method, similarity, details, diagnostics)
 
 
 def main():
@@ -185,12 +259,16 @@ def main():
     train.add_argument("--learning-rate", type=float, default=5e-5)
     train.add_argument("--seed", type=int, default=42)
     train.add_argument("--device", default="cpu")
+    train.add_argument("--representation", choices=REPRESENTATIONS, default="opcode-only",
+                       help="operand-bytes is a separate baseline requiring a new checkpoint")
     score = commands.add_parser("score")
     score.add_argument("inputs", type=Path)
     score.add_argument("--model", type=Path, required=True)
     score.add_argument("--output", type=Path, required=True)
     score.add_argument("--pooling", choices=("mean", "cls"), default="mean")
     score.add_argument("--device", default="cpu")
+    score.add_argument("--representation", choices=REPRESENTATIONS,
+                       help="Must match the saved checkpoint; inferred when omitted")
     args = parser.parse_args()
     try:
         if args.command == "prepare":

@@ -152,7 +152,8 @@ def split_blocks(instructions: list[Instruction]) -> list[list[Instruction]]:
 
 @dataclass(frozen=True)
 class Slot:
-    base: int
+    # The keccak access pattern can be known even when its base value is not.
+    base: int | None
     pattern: str
 
 
@@ -225,7 +226,9 @@ class Memory:
             return Word()
         base_word = self.load_word(offset + size - 32)
         slot = base_word.slot
-        if base_word.constant is not None and slot is None:
+        # Old: require a constant base before retaining the access pattern.
+        # Keep these two independently observable fields separate for Table 1.
+        if slot is None:
             slot = Slot(base_word.constant, "mapping" if size == 64 else "array")
         data = self.read(offset, size)
         digest = keccak.new(digest_bits=256, data=data).digest() if data is not None else None
@@ -377,7 +380,8 @@ class BlockState:
             # if name == "SSTORE":
             #     print("stored value:", self.top(2).constant)
             if word.slot is not None:
-                return ("store", name, hex(word.slot.base), word.slot.pattern)
+                base = hex(word.slot.base) if word.slot.base is not None else "[DYN_SLOT]"
+                return ("store", name, base, word.slot.pattern)
             if word.constant is not None:
                 return ("store", name, hex(word.constant), "direct")
             return ("store", name, "[DYN_SLOT]", "[DYN]")
@@ -391,7 +395,9 @@ class BlockState:
             # print("LOG fields:", name, "topics:", count, "topic0:", topic_field, "data bytes:", length)
             return ("log", name, count, topic_field, length if length is not None else "[DYN_DLEN]")
         if name in {"REVERT", "INVALID"}:
-            return ("exc", name, "unconditional")
+            # Old: return ("exc", name, "unconditional") for unknown guards too.
+            # analyze() upgrades this only when control-flow evidence is available.
+            return ("exc", name, "[DYN_COND]")
         if name == "RETURN":
             length = self.top(2).constant
             # print("RETURN offset / length:", self.top(1).constant, length)
@@ -466,14 +472,31 @@ def analyze(code: bytes) -> Analysis:
             edges.add((block[0].pc, successor))
             incoming[successor].add(condition)
 
+    # A path from entry containing no conditional or unresolved jump proves the
+    # exception is unconditional. An absent/unrecognized guard alone does not.
+    unconditional = set()
+    successors_by_pc = defaultdict(list)
+    for source, target in edges:
+        successors_by_pc[source].append(target)
+    blocks_by_pc = {block[0].pc: block for block in blocks}
+    pending = [blocks[0][0].pc] if blocks else []
+    while pending:
+        start = pending.pop()
+        if start in unconditional:
+            continue
+        unconditional.add(start)
+        if blocks_by_pc[start][-1].name != "JUMPI":
+            pending.extend(successors_by_pc[start])
+
     trace = []
     for block, events in zip(blocks, events_by_block):
         guards = incoming[block[0].pc]
         condition = next(iter(guards)) if len(guards) == 1 else None
         # print("incoming guards:", hex(block[0].pc), guards, "selected:", condition)
         for pc, event in events:
-            if event[0] == "exc" and condition is not None:
-                event = ("exc", event[1], condition)
+            if event[0] == "exc":
+                guard = "unconditional" if block[0].pc in unconditional else condition
+                event = ("exc", event[1], guard if guard is not None else "[DYN_COND]")
             trace.append((pc, event))
             # print("trace event:", hex(pc), event)
     # print("analysis totals:", len(blocks), "blocks,", len(edges), "edges,", len(trace), "events")

@@ -45,12 +45,15 @@ def field_traceability(pairs, out, details=False):
     fields = {"call": {"target": 2, "selector": 3, "input_length": 4, "value": 5},
               "store": {"base_slot": 2, "pattern": 3}, "log": {"topic0": 3, "data_length": 4},
               "exc": {"opcode": 1, "condition": 2}, "ret": {"return_length": 2}}
-    counters = {}
+    counters = {f"{kind}.{name}": {"total_events": 0, "known_events": 0,
+                "pairs_with_known": 0, "pairs_with_events": 0}
+                for kind, names in fields.items() for name in names}
     health = []
     for pair_row in pairs:
         events = extract_static_interleaved_trace(pair_row["a"])
         health.append({"id": pair_row["id"], "events": len(events)})
         found = set()
+        present = set()
         for event in events:
             kind = event[0]
             for name, index in fields[kind].items():
@@ -59,18 +62,26 @@ def field_traceability(pairs, out, details=False):
                     continue
                 key = f"{kind}.{name}"
                 known = not str(value).startswith("[DYN")
-                counter = counters.setdefault(key, {"total_events": 0, "known_events": 0, "pairs_with_known": 0})
+                counter = counters[key]
+                present.add(key)
                 counter["total_events"] += 1
                 counter["known_events"] += int(known)
                 if known:
                     found.add(key)
         for key in found:
             counters[key]["pairs_with_known"] += 1
+        for key in present:
+            counters[key]["pairs_with_events"] += 1
     records = []
     for key, counter in counters.items():
+        # Table 1 uses all reference bytecodes as denominator; event_rate is a
+        # separate diagnostic and must not silently replace that statistic.
         records.append({"field": key, **counter, "total_pairs": len(pairs),
-                        "event_rate": counter["known_events"] / counter["total_events"],
-                        "pair_rate": counter["pairs_with_known"] / len(pairs)})
+                        "unknown_events": counter["total_events"] - counter["known_events"],
+                        "event_rate": counter["known_events"] / counter["total_events"] if counter["total_events"] else None,
+                        "pair_rate": counter["pairs_with_known"] / len(pairs) if pairs else None,
+                        "pair_rate_among_present": counter["pairs_with_known"] / counter["pairs_with_events"]
+                        if counter["pairs_with_events"] else None})
     save_table(out / "field_traceability.csv", records)
     if details:
         save_table(out / "trace_health.csv", health)

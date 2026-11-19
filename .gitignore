@@ -12,6 +12,7 @@ smoke-results/
 smoke-tables/
 bytecodes/
 .temp/
+tmp/
 e2v-model/
 *.jsonl
 *.csv

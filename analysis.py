@@ -13,7 +13,8 @@ from data import MUTATIONS
 from util import (
     ALPHA_WEIGHTS, GAMMA, THETA_HI, THETA_LO, W_TAU, _edit_similarity, _trace_score,
     apply_soft_gating, calc_cfg_isomorphism_similarity_bc, calc_ngram_similarity_bc,
-    calc_opcode_edit_similarity_bc, compare_traces, extract_static_interleaved_trace, softmax_weights,
+    calc_opcode_edit_similarity_bc, compare_traces, extract_positioned_trace,
+    extract_static_interleaved_trace, softmax_weights,
     weighted_levenshtein,
 )
 
@@ -186,6 +187,7 @@ def ablation_scores(a: tuple, b: tuple, full) -> dict:
 
 
 def order_preservation(a: tuple, b: tuple) -> dict:
+    """Whole-runtime projection equality, retained only as a layout diagnostic."""
     def project(events, ops):
         names = ["LOG" if event[0] == "log" else event[1] for event in events]
         return tuple(name for name in names if name in ops)
@@ -196,6 +198,75 @@ def order_preservation(a: tuple, b: tuple) -> dict:
         if set(left) == set(right) == set(ops):
             out["-".join(ops)] = left == right
     return out
+
+
+def function_order_preservation(pair: dict) -> tuple[dict, dict]:
+    """Count relative order of externally matched events within each function.
+
+    A function_event_matches entry contains function_id, event_id, a_pc and
+    b_pc. Identities must come from reviewed source maps/function recovery;
+    opcode occurrence counts alone cannot establish cross-compiler identity.
+    Partial mappings are reported with their coverage, never as a full table.
+    """
+    positioned = [extract_positioned_trace(strip_metadata(pair[side]), strip_meta=False)
+                  for side in ("a", "b")]
+
+    def event_name(event):
+        if event[0] == "log":
+            return "LOG"
+        return "CALL" if event[0] == "call" else event[1]
+
+    eligible_ops = {name for ops in ORDER_PAIRS for name in ops}
+    events = [{pc: event_name(event) for pc, event in side
+               if event_name(event) in eligible_ops} for side in positioned]
+    matches = pair.get("function_event_matches")
+    coverage = {"scope": "within_function_matched_event_pairs",
+                "available": matches is not None, "matched_events": 0,
+                "total_events_a": len(events[0]), "total_events_b": len(events[1]),
+                "complete": False}
+    if matches is None:
+        coverage["reason"] = "function_event_matches not supplied"
+        return {}, coverage
+    if not isinstance(matches, list):
+        raise ValueError(f"{pair['id']}: function_event_matches must be a list")
+
+    functions = defaultdict(list)
+    identities, used_a, used_b = set(), set(), set()
+    for match in matches:
+        if not isinstance(match, dict):
+            raise ValueError(f"{pair['id']}: invalid function-event match")
+        function, event_id = match.get("function_id"), match.get("event_id")
+        pc_a, pc_b = match.get("a_pc"), match.get("b_pc")
+        if (not isinstance(function, str) or not function.strip()
+                or not isinstance(event_id, str) or not event_id.strip()
+                or type(pc_a) is not int or type(pc_b) is not int):
+            raise ValueError(f"{pair['id']}: match needs function_id, event_id and integer PCs")
+        identity = function, event_id
+        if identity in identities or pc_a in used_a or pc_b in used_b:
+            raise ValueError(f"{pair['id']}: duplicate event identity or matched PC")
+        op_a, op_b = events[0].get(pc_a), events[1].get(pc_b)
+        if op_a is None or op_a != op_b:
+            raise ValueError(f"{pair['id']}: matched PCs must refer to the same key event type")
+        identities.add(identity)
+        used_a.add(pc_a)
+        used_b.add(pc_b)
+        functions[function].append((op_a, pc_a, pc_b))
+
+    counts = {}
+    for left, right in ORDER_PAIRS:
+        total = preserved = 0
+        for matched in functions.values():
+            lhs = [event for event in matched if event[0] == left]
+            rhs = [event for event in matched if event[0] == right]
+            for _, a_left, b_left in lhs:
+                for _, a_right, b_right in rhs:
+                    total += 1
+                    preserved += (a_left < a_right) == (b_left < b_right)
+        if total:
+            counts[f"{left}-{right}"] = {"eligible": total, "preserved": preserved}
+    coverage.update(matched_events=len(matches),
+                    complete=used_a == set(events[0]) and used_b == set(events[1]))
+    return counts, coverage
 
 
 def external_scores(path_records: list[dict], pairs: list[dict]) -> dict:
@@ -250,7 +321,10 @@ def score_pairs(pairs: list[dict], external: dict) -> list[dict]:
         if row["dataset"] in {"opt", "ver", "mut"}:
             row["ablations"] = ablation_scores(t_a, t_b, result)
         if row["dataset"] in {"opt", "ver"}:
-            row["order"] = order_preservation(t_a, t_b)
+            # Old: row["order"] = order_preservation(t_a, t_b)
+            # Whole-runtime sequence equality is not the paper's function-pair rate.
+            row["runtime_order"] = order_preservation(t_a, t_b)
+            row["order"], row["order_coverage"] = function_order_preservation(pair)
         if row["dataset"] in {"mut", "mixed"} and row.get("label") == 0:
             row["layers"] = {}
             for kind in W_TAU:
@@ -357,6 +431,45 @@ def binary_metrics(labels, scores, threshold: float) -> dict:
 # # print(threshold_counts(case_labels, case_scores))
 
 
+def bootstrap_strata(rows: list[dict], labels: np.ndarray) -> tuple[list, dict]:
+    """Group whole contracts, stratified by each cluster's class counts.
+
+    Resampling within (negative, positive) count strata preserves the observed
+    class totals, including the one-positive/two-negative Temporal design.
+    """
+    contracts = defaultdict(list)
+    missing_identity = False
+    for index, row in enumerate(rows):
+        identifier = row.get("contract_id")
+        if isinstance(identifier, str) and identifier.strip():
+            key = ("contract", identifier.strip().lower())
+            # A content-derived legacy key can join exact duplicates, but it
+            # cannot certify that compiler variants share a deployed address.
+            missing_identity |= bool(row.get("contract_id_source"))
+        else:
+            key = ("row", str(index))
+            missing_identity = True
+        contracts[key].append(index)
+    profiles = defaultdict(list)
+    for key in sorted(contracts):
+        indices = np.array(contracts[key], dtype=int)
+        profile = tuple(int(np.count_nonzero(labels[indices] == label)) for label in (0, 1))
+        profiles[profile].append(indices)
+    repeated = any(len(indices) > 1 for group in profiles.values() for indices in group)
+    return [profiles[key] for key in sorted(profiles)], {
+        "bootstrap_unit": "contract" if repeated else "pair",
+        "bootstrap_stratification": "contract_label_counts" if repeated else "label",
+        "n_contracts": len(contracts),
+        "bootstrap_singleton_strata": sum(len(group) == 1 for group in profiles.values()),
+        "bootstrap_identity_complete": not missing_identity,
+    }
+
+
+def draw_bootstrap_indices(strata: list, rng: np.random.Generator) -> np.ndarray:
+    return np.concatenate([cluster for group in strata
+                           for cluster in (group[index] for index in rng.integers(len(group), size=len(group)))])
+
+
 def classification(rows: list[dict], threshold: float, bootstrap: int, seed: int) -> dict:
     out = {}
     for method in METHODS:
@@ -372,15 +485,13 @@ def classification(rows: list[dict], threshold: float, bootstrap: int, seed: int
         out[method] = {"n": len(usable), **values}
         if bootstrap:
             rng = np.random.default_rng(seed)
-            positive = np.flatnonzero(labels == 1)
-            negative = np.flatnonzero(labels == 0)
-            # print("bootstrap strata:", len(positive), len(negative), "repeats:", bootstrap, "seed:", seed)
+            strata, metadata = bootstrap_strata(usable, labels)
+            out[method].update(metadata, bootstrap_resamples=bootstrap)
             samples = []
             for _ in range(bootstrap):
-                ids = np.concatenate((rng.choice(positive, len(positive)), rng.choice(negative, len(negative))))
-                # assert len(ids) == len(labels)
-                # assert np.count_nonzero(labels[ids] == 1) == len(positive)
-                # print("resampled unique rows:", len(np.unique(ids)))
+                # Old: independently resample positive and negative pairs.
+                # Keep correlated observations from the same contract together.
+                ids = draw_bootstrap_indices(strata, rng)
                 metric = binary_metrics(labels[ids], scores[ids], threshold)
                 samples.append(list(metric.values()))
             intervals = np.percentile(samples, [2.5, 97.5], axis=0).T.tolist()
@@ -439,10 +550,32 @@ def grouped(rows: list[dict], key: str, default="unclassified") -> dict:
 
 def order_summary(rows: list[dict]) -> dict:
     result = {}
+    coverage = [row.get("order_coverage", {}) for row in rows]
     for left, right in ORDER_PAIRS:
         key = f"{left}-{right}"
-        flags = [row["order"][key] for row in rows if key in row["order"]]
-        result[key] = {"n": len(flags), "preserved": sum(flags) / len(flags) if flags else None}
+        # Old: average one whole-runtime equality flag per contract. The correct
+        # denominator is the number of matched within-function event pairs.
+        counts = [row["order"][key] for row in rows if key in row.get("order", {})]
+        total = sum(count["eligible"] for count in counts)
+        preserved = sum(count["preserved"] for count in counts)
+        result[key] = {"n": total, "preserved": preserved / total if total else None,
+                       "scope": "within_function_matched_event_pairs", "total_pairs": len(rows),
+                       "annotated_pairs": sum(bool(item.get("available")) for item in coverage),
+                       "complete": bool(rows) and all(item.get("complete", False) for item in coverage),
+                       "matched_events": sum(item.get("matched_events", 0) for item in coverage),
+                       "total_events_a": sum(item.get("total_events_a", 0) for item in coverage),
+                       "total_events_b": sum(item.get("total_events_b", 0) for item in coverage)}
+    return result
+
+
+def runtime_order_summary(rows: list[dict]) -> dict:
+    """Retain the old diagnostic without presenting it as function-pair data."""
+    result = {}
+    for left, right in ORDER_PAIRS:
+        key = f"{left}-{right}"
+        flags = [row["runtime_order"][key] for row in rows if key in row.get("runtime_order", {})]
+        result[key] = {"scope": "whole_runtime_sequence_equality", "n": len(flags),
+                       "preserved": sum(flags) / len(flags) if flags else None}
     return result
 
 
@@ -555,8 +688,10 @@ def summarize(pairs: list[dict], rows: list[dict], threshold: float, bootstrap: 
     for version, records in grouped(ver, "version").items():
         version_scores[version] = metric_distributions(records, threshold)
     order = {"opt": order_summary(opt)}
+    runtime_order = {"opt": runtime_order_summary(opt)}
     for group, records in grouped(ver, "group").items():
         order[group] = order_summary(records)
+        runtime_order[group] = runtime_order_summary(records)
 
     thresholds = {}
     for level in (0.50, 0.60, 0.70, 0.80, 0.85):
@@ -595,6 +730,7 @@ def summarize(pairs: list[dict], rows: list[dict], threshold: float, bootstrap: 
             "groups": version_groups,
             "by_version": version_scores,
             "order": order,
+            "runtime_order_diagnostic": runtime_order,
         },
         "rq3_mut": {
             "classification": classification(mut, threshold, bootstrap, seed),

@@ -11,7 +11,7 @@ REPORT_FILES = (
     "llm_ranks.csv", "llm_nemenyi.csv", "mutation_replay.csv", "mut_operating_points.csv",
     "mut_layered_detection.csv", "mut_traceability_groups.csv", "temporal_summary.csv", "cost_summary.csv",
     "raw_cost.csv", "field_traceability.csv", "trace_health.csv", "noise_spearman.csv", "input_pairs.jsonl",
-    "pair_scores.jsonl", "pair_scores.csv", "mechanism_checks.jsonl",
+    "pair_scores.jsonl", "pair_scores.csv", "mechanism_checks.jsonl", "runtime_order_diagnostic.csv",
 )
 
 
@@ -63,6 +63,14 @@ def save_experiment_tables(summary, out, details=False):
             if values["n"]:
                 records.append({"group": group, "event_pair": event_pair, **values})
     save_table(out / "ver_order.csv", records)
+
+    # Old whole-runtime equality is diagnostic only, never a substitute for the
+    # manuscript's matched event pairs within each function.
+    diagnostic = []
+    for group, events in ver.get("runtime_order_diagnostic", {}).items():
+        for event_pair, values in events.items():
+            diagnostic.append({"group": group, "event_pair": event_pair, **values})
+    save_table(out / "runtime_order_diagnostic.csv", diagnostic)
 
     records = []
     for row in method_rows(mut["classification"]):
@@ -146,7 +154,11 @@ def save_core_tables(summary, out, details=False):
         validation.append({"operator": operator, "sampled": sampled, "confirmed": confirmed,
                            "no_divergence": executable - confirmed, "undeployable": sampled - executable,
                            "confirmation_rate_all": confirmed / sampled if sampled else None,
-                           "confirmation_rate_executable": row["confirmation_rate"]})
+                           "confirmation_rate_executable": row["confirmation_rate"],
+                           "evidence_scope": row.get("evidence_scope", "legacy_unspecified"),
+                           "ordered_pairs": row.get("ordered_pairs", 0),
+                           "legacy_unordered_pairs": row.get("legacy_unordered_pairs", 0),
+                           "diagnostic_only_pairs": row.get("diagnostic_only_pairs", 0)})
     save_table(out / "mutation_replay.csv", validation)
 
     operating_points = []
@@ -210,6 +222,20 @@ def all_scores_present(scores, count, methods=METHODS):
     return True
 
 
+def classification_evidence_present(scores, count, methods=METHODS, contracts=None):
+    if not all_scores_present(scores, count, methods):
+        return False
+    for method in methods:
+        score = scores[method]
+        if (not score.get("bootstrap_ci95") or score.get("bootstrap_resamples", 0) < 1000
+                or not score.get("bootstrap_identity_complete", False)):
+            return False
+        if contracts is not None and (score.get("n_contracts") != contracts
+                                      or score.get("bootstrap_unit") != "contract"):
+            return False
+    return True
+
+
 def core_coverage(summary, out):
     """Check table inputs and sample counts against the manuscript."""
     counts = summary["counts"]
@@ -244,26 +270,38 @@ def core_coverage(summary, out):
             traceability_ready = False
 
     temporal = mut["temporal"]
-    temporal_ready = all_scores_present(temporal["classification"], 450, ("OED", "CFG", "E2V", "SmartTrans", "SITM"))
+    temporal_ready = classification_evidence_present(temporal["classification"], 450,
+                         ("OED", "CFG", "E2V", "SmartTrans", "SITM"), contracts=150)
+    design = summary.get("temporal_design", {})
+    temporal_ready = temporal_ready and design.get("contracts") == 150 and design.get("one_positive_two_negative_per_contract", False)
     for method in ("OED", "CFG", "E2V", "SmartTrans", "SITM"):
         if temporal["optimizer_equivalence"].get(method, {}).get("n") != 150:
             temporal_ready = False
     noise_ready = all(all_scores_present(noise.get(kind, {}), 500) for kind in NOISE_TYPES)
-    replay_ready = all(replay.get(kind, {}).get("sampled") == 20 for kind in MUTATIONS)
-    classification_ready = mut_ready and all_scores_present(mut["classification"], 2000)
+    replay_ready = all(replay.get(kind, {}).get("sampled") == 20
+                       and replay[kind].get("executable", 0) > 0
+                       and replay[kind].get("ordered_pairs", 0) == replay[kind].get("executable")
+                       and replay[kind].get("evidence_scope") == "observed_behavior" for kind in MUTATIONS)
+    classification_ready = mut_ready and classification_evidence_present(mut["classification"], 2000)
+    order = summary["rq2_ver"]["order"]
+    order_ready = counts.get("opt") == 24079 and versions_ready and all(
+        order.get(group) and all(order[group].get(event_pair, {}).get("complete", False)
+                                and order[group][event_pair].get("n", 0) > 0
+                                for event_pair in ("CALL-SSTORE", "SSTORE-LOG", "CALL-LOG"))
+        for group in ("opt", "minor", "major"))
 
     entries = [
         (1, "field_traceability.csv", counts.get("opt") == 24079, "24,079 Opt-Pair reference bytecodes"),
         (2, "alpha_calibration.csv", counts.get("calibration") == 500, "500 equivalent calibration pairs"),
         (3, "ver_groups.csv", versions_ready, "520 minor and 158 major Ver-Pair samples"),
-        (4, "ver_order.csv", False, "Current statistic projects whole-runtime events; paper counts events within functions"),
-        (5, "mutation_replay.csv", replay_ready, "20 archived replay observations per operator"),
+        (4, "ver_order.csv", order_ready, "Matched within-function event pairs; complete annotations required"),
+        (5, "mutation_replay.csv", replay_ready, "20 replay cases per operator; ordered behavior evidence; gas/root diagnostics excluded"),
         (6, "mut_classification.csv", classification_ready, "1,000 equivalent and 1,000 mutated pairs, all methods"),
         (7, "mut_operating_points.csv", mut_ready, "Balanced Mut-Set at thresholds 0.60 and 0.80"),
         (8, "mut_by_operator.csv", baselines_ready, "200 negatives per operator, all methods"),
         (9, "mut_layered_detection.csv", operators_ready, "200 negatives per operator"),
         (10, "mut_traceability_groups.csv", traceability_ready, "CH/SH labeled static or dynamic"),
-        (11, "temporal_summary.csv", temporal_ready, "450 independent temporal pairs, 150 optimizer positives"),
+        (11, "temporal_summary.csv", temporal_ready, "450 pairs from 150 independent contracts; contract-cluster confidence intervals"),
         (12, "noise_summary.csv", noise_ready, "500 pairs per noise type with clean/noisy scores"),
         (13, "ablation_summary.csv", counts.get("opt") == 24079 and versions_ready and mut_ready,
          "Opt-Pair, Ver-Pair and Mut-Set; local three-layer aggregation is described in README"),

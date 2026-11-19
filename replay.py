@@ -68,8 +68,24 @@ def seed_account(url: str, address: str, state: dict) -> None:
         rpc(url, "anvil_setStorageAt", address, f"0x{integer(slot):064x}", f"0x{integer(value):064x}")
 
 
-def observable_steps(steps: list[dict]) -> tuple[list, list, list]:
-    calls, writes, exceptions = [], [], []
+def observable_steps(steps: list[dict]) -> tuple[list, list, list, list]:
+    """Return legacy projections and a single, ordered behavioral event stream.
+
+    PCs and gas costs are deliberately absent from comparable events: equivalent
+    compiler configurations can change both without changing these observations.
+    """
+    calls, writes, exceptions, events = [], [], [], []
+
+    def memory_prefix(step, offset, size):
+        if size and "memory" not in step:
+            raise ValueError("Trace memory is missing for a nonempty CALL/LOG input; enable memory tracing")
+        memory = step.get("memory") or ""
+        if isinstance(memory, list):
+            memory = "".join(word.removeprefix("0x") for word in memory)
+        # Unallocated EVM memory is zero-filled. Size plus a zero-trimmed prefix
+        # has a canonical representation without allocating attacker-sized data.
+        return bytecode_bytes(memory)[offset:offset + size].rstrip(b"\0").hex()
+
     for step in steps:
         name, depth = step["op"], step["depth"]
         if name in CALL_OPS:
@@ -78,24 +94,35 @@ def observable_steps(steps: list[dict]) -> tuple[list, list, list]:
             arity = 7 if has_value else 6
             if len(args) < arity:
                 exceptions.append([depth, "CALL_STACK_UNDERFLOW"])
+                events.append({"kind": "exception", "depth": depth, "op": "CALL_STACK_UNDERFLOW"})
                 continue
             offset_index = 3 if has_value else 2
             offset, size = args[offset_index:offset_index + 2]
-            memory = step.get("memory") or ""
-            if isinstance(memory, list):
-                memory = "".join(word.removeprefix("0x") for word in memory)
-            data = bytecode_bytes(memory)
-            # A suffix of zeroes is implicit. Retain the total requested size.
-            prefix = data[offset:offset + size].rstrip(b"\0")
+            prefix = memory_prefix(step, offset, size)
             calls.append([depth, name, f"0x{args[1] & ((1 << 160)-1):040x}",
-                          args[2] if has_value else 0, size, prefix.hex()])
+                          args[2] if has_value else 0, size, prefix])
+            events.append({"kind": "call", "depth": depth, "op": name,
+                           "target": calls[-1][2], "value": calls[-1][3],
+                           "input_size": size, "input_prefix": prefix})
         elif name == "SSTORE":
             args = step.get("stack", [])
             if len(args) >= 2:
                 writes.append([depth, int(args[-1], 16), int(args[-2], 16)])
-        elif name in {"REVERT", "INVALID"} or step.get("error"):
+                events.append({"kind": "write", "depth": depth, "op": name,
+                               "slot": writes[-1][1], "value": writes[-1][2]})
+        elif name in {"LOG0", "LOG1", "LOG2", "LOG3", "LOG4"}:
+            args = [int(word, 16) for word in reversed(step.get("stack", []))]
+            count = int(name[3:])
+            if len(args) >= count + 2:
+                offset, size = args[:2]
+                events.append({"kind": "log", "depth": depth, "op": name,
+                               "topics": [f"0x{topic:064x}" for topic in args[2:2 + count]],
+                               "data_size": size, "data_prefix": memory_prefix(step, offset, size)})
+        if name in {"REVERT", "INVALID"} or step.get("error"):
             exceptions.append([depth, name])
-    return calls, writes, exceptions
+            events.append({"kind": "exception", "depth": depth, "op": name})
+    # Old: return calls, writes, exceptions. Separate lists lose CALL/SSTORE order.
+    return calls, writes, exceptions, events
 
 
 def replay_side(case: dict, code: str, executable: str) -> list[dict]:
@@ -124,14 +151,15 @@ def replay_side(case: dict, code: str, executable: str) -> list[dict]:
             transaction = rpc(url, "eth_sendTransaction", request)
             receipt = rpc(url, "eth_getTransactionReceipt", transaction)
             result = rpc(url, "debug_traceTransaction", transaction, {"enableMemory": True, "disableStorage": True})
-            calls, writes, exceptions = observable_steps(result["structLogs"])
+            calls, writes, exceptions, events = observable_steps(result["structLogs"])
             logs = [{key: entry[key] for key in ("address", "topics", "data")} for entry in receipt["logs"]]
             proof = rpc(url, "eth_getProof", target, [], receipt["blockNumber"])
             block = rpc(url, "eth_getBlockByHash", receipt["blockHash"], False)
-            observations.append({"calls": calls, "writes": writes, "logs": logs,
+            observations.append({"calls": calls, "writes": writes, "logs": logs, "events": events,
                                  "exit": {"status": receipt["status"], "exceptions": exceptions,
                                           "return_value": result["returnValue"]},
-                                 "storage_root": proof["storageHash"], "receipts_root": block["receiptsRoot"]})
+                                 "storage_root": proof["storageHash"], "receipts_root": block["receiptsRoot"],
+                                 "gas_used": receipt["gasUsed"]})
         return observations
 
 
@@ -153,5 +181,5 @@ def run_replays(cases: list[dict], pairs: list[dict], executable: str) -> list[d
         transactions = []
         for context, a, b in zip(case["transactions"], original, mutated):
             transactions.append({"context": context, "a": a, "b": b})
-        results.append({"id": identifier, "transactions": transactions})
+        results.append({"id": identifier, "schema_version": 2, "transactions": transactions})
     return results

@@ -1,11 +1,47 @@
 import argparse
+import json
 import pickle
+import re
 import runpy
 import sys
 from functools import lru_cache
 from pathlib import Path
 
-from model_scores import bytecode_id, export_bytecodes, score_file
+from model_scores import artifact_fingerprint, artifact_hashes, bytecode_id, export_bytecodes, file_sha256, score_file
+
+
+def training_provenance(path, checkpoint_hash, required=False):
+    """Bind archived training declarations to the exact inference checkpoint.
+
+    Hashes establish artifact identity, not that a claimed training run occurred.
+    The training script and manifests must still be included in the release.
+    """
+    if path is None:
+        if required:
+            raise ValueError("SmartTrans training provenance is required; supply --training-provenance")
+        return {"status": "unprovided"}
+    metadata = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError("Expected an object in SmartTrans training provenance")
+    required_fields = {"checkpoint_sha256", "train_manifest_sha256", "training_code_sha256",
+                       "training_contracts", "seed", "epochs", "batch_size", "learning_rate"}
+    missing = required_fields - metadata.keys()
+    if missing:
+        raise ValueError(f"Missing SmartTrans training provenance fields: {', '.join(sorted(missing))}")
+    for key in ("checkpoint_sha256", "train_manifest_sha256", "training_code_sha256"):
+        if not isinstance(metadata[key], str) or not re.fullmatch(r"[0-9a-fA-F]{64}", metadata[key]):
+            raise ValueError(f"Invalid SHA256 in SmartTrans training provenance: {key}")
+    if metadata["checkpoint_sha256"].lower() != checkpoint_hash:
+        raise ValueError("SmartTrans training provenance belongs to a different checkpoint")
+    for key in ("training_contracts", "epochs", "batch_size"):
+        if type(metadata[key]) is not int or metadata[key] < 1:
+            raise ValueError(f"Expected a positive integer in SmartTrans training provenance: {key}")
+    if type(metadata["seed"]) is not int or metadata["seed"] < 0:
+        raise ValueError("Expected a nonnegative seed in SmartTrans training provenance")
+    rate = metadata["learning_rate"]
+    if type(rate) not in (int, float) or not 0 < rate < float("inf"):
+        raise ValueError("Expected a finite positive learning_rate in SmartTrans training provenance")
+    return {"status": "archived_metadata", "file_sha256": file_sha256(path), "metadata": metadata}
 
 
 def read_functions(path):
@@ -49,6 +85,9 @@ def contract_similarity(left, right):
 
 
 def score(args):
+    checkpoint_hash = file_sha256(args.checkpoint)
+    training = training_provenance(getattr(args, "training_provenance", None), checkpoint_hash,
+                                   getattr(args, "require_training_provenance", False))
     import torch
     from transformers import AutoTokenizer
 
@@ -101,7 +140,7 @@ def score(args):
                              for text in texts[start:start + args.batch_size]]
                     ids, masks = zip(*batch)
                     # print("function batch:", start, "size:", len(ids), "sequence length:", len(ids[0]))
-                    
+
                     outputs = model(input_ids=torch.tensor(ids, device=args.device),
                                     attention_mask=torch.tensor(masks, device=args.device))
                     # print("encoder output:", tuple(outputs.shape))
@@ -113,8 +152,21 @@ def score(args):
         def similarity(a, b):
             return contract_similarity(embed(bytecode_id(a)), embed(bytecode_id(b)))
 
-        details = {"checkpoint": args.checkpoint.name, "encoder": "official_smarttrans",
-                   "aggregation": "symmetric_mean_best_function_cosine", "max_length": 512}
+        # Old output named only the checkpoint; two different training runs
+        # with the same filename were indistinguishable in the result archive.
+        details = {"checkpoint": args.checkpoint.name, "checkpoint_sha256": checkpoint_hash,
+                   "encoder": "official_smarttrans", "training_provenance": training,
+                   "aggregation": "symmetric_mean_best_function_cosine", "max_length": 512,
+                   "scoring_code_sha256": file_sha256(Path(__file__)),
+                   "pretrain_files_sha256": artifact_hashes(args.pretrain),
+                   "tokenizer_files_sha256": artifact_hashes(args.repo / "tokenizer"),
+                   "encoder_code_sha256": file_sha256(args.repo / "models.py")}
+        if args.functions:
+            details["functions_sha256"] = file_sha256(args.functions)
+        else:
+            details["facts_fingerprint"] = artifact_fingerprint(args.facts)
+            details["preprocess_code_sha256"] = {name: file_sha256(args.repo / name)
+                                                 for name in ("1.Analyze_gigahorse.py", "2.Preprocess.py")}
         score_file(args.inputs, args.output, "SmartTrans", similarity, details)
     finally:
         sys.path.remove(with_repo)
@@ -137,6 +189,10 @@ def main():
     evaluate.add_argument("--output", type=Path, required=True)
     evaluate.add_argument("--device", default="cpu")
     evaluate.add_argument("--batch-size", type=int, default=16)
+    evaluate.add_argument("--training-provenance", type=Path,
+                          help="JSON with checkpoint, training manifest/code hashes and training configuration")
+    evaluate.add_argument("--require-training-provenance", action="store_true",
+                          help="Reject inference without archived training provenance")
     args = parser.parse_args()
     try:
         if args.command == "export-bytecodes":

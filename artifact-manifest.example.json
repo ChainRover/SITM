@@ -1,0 +1,13 @@
+{
+  "description": "Template only. Replace paths and hashes with actual archived files before using --strict-paper.",
+  "artifacts": [
+    {"role": "source_inventory", "path": "data/contracts.jsonl", "sha256": "REPLACE_WITH_ACTUAL_SHA256"},
+    {"role": "split_manifest", "path": "data/splits.jsonl", "sha256": "REPLACE_WITH_ACTUAL_SHA256"},
+    {"role": "mutation_recipes", "path": "data/recipes.jsonl", "sha256": "REPLACE_WITH_ACTUAL_SHA256"},
+    {"role": "replay_cases", "path": "data/replay_cases.jsonl", "sha256": "REPLACE_WITH_ACTUAL_SHA256"},
+    {"role": "e2v_training", "path": "e2v-model/training.json", "sha256": "REPLACE_WITH_ACTUAL_SHA256"},
+    {"role": "smarttrans_training", "path": "data/smarttrans_training.json", "sha256": "REPLACE_WITH_ACTUAL_SHA256"},
+    {"role": "e2v_checkpoint", "path": "e2v-model/model.safetensors", "sha256": "REPLACE_WITH_ACTUAL_SHA256"},
+    {"role": "smarttrans_checkpoint", "path": "data/smarttrans.pt", "sha256": "REPLACE_WITH_ACTUAL_SHA256"}
+  ]
+}
