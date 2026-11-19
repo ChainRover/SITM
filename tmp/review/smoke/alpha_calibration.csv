@@ -1,0 +1,6 @@
+event,alpha,n,mean_trace,variance
+call,1.0,1,1.0,0.0
+store,1.0,1,1.0,0.0
+log,1.0,1,1.0,0.0
+exc,1.0,1,1.0,0.0
+ret,1.0,1,1.0,0.0

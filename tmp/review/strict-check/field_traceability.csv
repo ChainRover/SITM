@@ -1,0 +1,12 @@
+field,total_events,known_events,pairs_with_known,pairs_with_events,total_pairs,unknown_events,event_rate,pair_rate,pair_rate_among_present
+call.target,2,2,1,1,1,0,1.0,1.0,1.0
+call.selector,2,2,1,1,1,0,1.0,1.0,1.0
+call.input_length,2,2,1,1,1,0,1.0,1.0,1.0
+call.value,2,2,1,1,1,0,1.0,1.0,1.0
+store.base_slot,1,1,1,1,1,0,1.0,1.0,1.0
+store.pattern,1,1,1,1,1,0,1.0,1.0,1.0
+log.topic0,1,1,1,1,1,0,1.0,1.0,1.0
+log.data_length,1,1,1,1,1,0,1.0,1.0,1.0
+exc.opcode,3,3,1,1,1,0,1.0,1.0,1.0
+exc.condition,3,1,1,1,1,2,0.3333333333333333,1.0,1.0
+ret.return_length,0,0,0,0,1,0,,0.0,

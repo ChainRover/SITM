@@ -1,0 +1,11 @@
+field,total_events,known_events,pairs_with_known,total_pairs,event_rate,pair_rate
+exc.opcode,3,3,1,1,1.0,1.0
+exc.condition,3,3,1,1,1.0,1.0
+store.base_slot,1,1,1,1,1.0,1.0
+store.pattern,1,1,1,1,1.0,1.0
+call.target,2,2,1,1,1.0,1.0
+call.selector,2,2,1,1,1.0,1.0
+call.input_length,2,2,1,1,1.0,1.0
+call.value,2,2,1,1,1.0,1.0
+log.topic0,1,1,1,1,1.0,1.0
+log.data_length,1,1,1,1,1.0,1.0

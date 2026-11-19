@@ -1,0 +1,7 @@
+group,event_pair,scope,n,preserved
+opt,CALL-SSTORE,whole_runtime_sequence_equality,1,1.0
+opt,SSTORE-LOG,whole_runtime_sequence_equality,1,1.0
+opt,CALL-LOG,whole_runtime_sequence_equality,1,1.0
+major,CALL-SSTORE,whole_runtime_sequence_equality,1,1.0
+major,SSTORE-LOG,whole_runtime_sequence_equality,1,1.0
+major,CALL-LOG,whole_runtime_sequence_equality,1,1.0

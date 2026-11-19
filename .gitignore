@@ -4,7 +4,6 @@ __pycache__/
 .checks/
 .sitm-solc/
 local/
-data/
 dataset/
 results/
 results-*/
@@ -12,7 +11,6 @@ smoke-results/
 smoke-tables/
 bytecodes/
 .temp/
-tmp/
 e2v-model/
 *.jsonl
 *.csv
@@ -24,3 +22,10 @@ e2v-model/
 *.tmp
 .env
 .env.*
+
+# Keep data and temporary review artifacts eligible for version control,
+# including file types excluded by the general rules above.
+!data/
+!data/**
+!tmp/
+!tmp/**

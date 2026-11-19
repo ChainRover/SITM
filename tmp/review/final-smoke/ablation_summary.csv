@@ -1,0 +1,6 @@
+method,opt_mean_dev,ver_mean_dev,roc_auc,CH_detect,RS_detect
+SITM,0.0,0.0778662265811465,1.0,1.0,
+w/o_interleave(3layer),0.0,0.0,1.0,1.0,
+w/o_soft_gating,0.0,0.0778662265811465,1.0,0.0,
+w/o_type_weight,0.0,0.2857142857142857,1.0,1.0,
+w/o_fine_fields,0.0,0.0,0.5,0.0,

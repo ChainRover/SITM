@@ -1,0 +1,6 @@
+method,n,roc_auc,pr_auc,precision,recall,f1,fpr,bootstrap_unit,bootstrap_stratification,n_contracts,bootstrap_singleton_strata,bootstrap_identity_complete,bootstrap_resamples,roc_auc_ci_low,roc_auc_ci_high,pr_auc_ci_low,pr_auc_ci_high,precision_ci_low,precision_ci_high,recall_ci_low,recall_ci_high,f1_ci_low,f1_ci_high,fpr_ci_low,fpr_ci_high
+OED,4,0.0,0.375,0.75,1.0,0.8571428571428571,1.0,contract,contract_label_counts,3,1,True,20,0.0,0.0,0.375,0.375,0.75,0.75,1.0,1.0,0.8571428571428571,0.8571428571428571,1.0,1.0
+CFG,4,0.0,0.375,0.0,0.0,0.0,1.0,contract,contract_label_counts,3,1,True,20,0.0,0.0,0.375,0.375,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1.0
+NG,4,1.0,1.0,0.75,1.0,0.8571428571428571,1.0,contract,contract_label_counts,3,1,True,20,1.0,1.0,1.0,1.0,0.75,0.75,1.0,1.0,0.8571428571428571,0.8571428571428571,1.0,1.0
+SF,4,0.0,0.375,0.0,0.0,0.0,1.0,contract,contract_label_counts,3,1,True,20,0.0,0.0,0.375,0.375,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1.0
+SITM,4,1.0,1.0,1.0,1.0,1.0,0.0,contract,contract_label_counts,3,1,True,20,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.0,0.0

@@ -1,0 +1,14 @@
+table,csv,status,inputs_and_scope
+1,field_traceability.csv,partial,"24,079 Opt-Pair reference bytecodes"
+2,alpha_calibration.csv,partial,500 equivalent calibration pairs
+3,ver_groups.csv,partial,520 minor and 158 major Ver-Pair samples
+4,ver_order.csv,missing,Matched within-function event pairs; complete annotations required
+5,mutation_replay.csv,missing,20 replay cases per operator; ordered behavior evidence; gas/root diagnostics excluded
+6,mut_classification.csv,partial,"1,000 equivalent and 1,000 mutated pairs, all methods"
+7,mut_operating_points.csv,partial,Balanced Mut-Set at thresholds 0.60 and 0.80
+8,mut_by_operator.csv,partial,"200 negatives per operator, all methods"
+9,mut_layered_detection.csv,partial,200 negatives per operator
+10,mut_traceability_groups.csv,partial,CH/SH labeled static or dynamic
+11,temporal_summary.csv,partial,450 pairs from 150 independent contracts; contract-cluster confidence intervals
+12,noise_summary.csv,partial,500 pairs per noise type with clean/noisy scores
+13,ablation_summary.csv,partial,"Opt-Pair, Ver-Pair and Mut-Set; local three-layer aggregation is described in README"

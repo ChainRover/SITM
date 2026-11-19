@@ -1,0 +1,2087 @@
+
+--- PAGE 1 ---
+SITM: A Compiler-Configuration-Robust Similarity Metric for Smart
+Contract Bytecode
+Lei Xiaoa,∗, ZiBin Zhenga, XiYue Zhoua and YiJie Caia
+aXiamen University of Technology, Xiamen, Fujian, China
+ARTICLE INFO
+Keywords:
+smart contracts
+runtime bytecode
+static interleaved trace metric
+compiler configuration robustness
+EVM
+ABSTRACT
+Quality assessment of smart contract bytecode decompilation, vulnerability homology analysis, and
+codeclonedetectionreliesonreliablemeasurementofbytecodesimilarity.Traditionalmethodsadopt
+structural approximation metrics such as opcode edit distance and control-flow graph isomorphism
+for fast measurement. However, the low-level structure of bytecode is strongly correlated with
+compiler version and optimization level: bytecode generated from the same source under different
+compilation configurations is often misjudged as dissimilar, while structurally similar bytecode may
+be semantically opposite. Even deep learning approaches often generalize poorly due to the lack of
+high-quality labeled data.
+We propose the Static Interleaved Trace Metric (SITM). SITM builds a Static Interleaved Trace
+(SIT) interleaving typed events: external calls, storage accesses, event emissions, exceptional reverts,
+and returns. in bytecode layout order, adding fine-grained features (function selectors, storage base
+slots, event signatures). Similarity uses type-weighted edit distance with globally fixed calibration
+weights.Sincecallsdetermineassetflows,SITMappliesboundedsoftgatingtothecallsubsequence,
+trading∼0.015overallAUCfordetectingsystematicmulti-callredirection.Single-pointcallhijacking
+is not covered by default and requires symbolic/dynamic differential rechecking.
+Four controlled experiments, a downstream task, and an ablation show that SITM reduces
+optimizer-induced deviation by about 87% versus OED; on 2,000 semantic-opposite mutation pairs,
+ROC-AUC is 0.97 (95% CI±0.02), outperforming structural baselines among training-free methods.
+It complements an open-source supervised Transformer in cost, interpretability, and training-free
+deployment, with better version retention and noise robustness; SIT raises reentrancy detection from
+39% to 76%. SITM is a low-cost pre-screening metric for statically traceable contracts; it does not
+claim formal equivalence, and hits need rechecking.
+1. Introduction
+With the large-scale deployment of closed-source smart
+contracts in the Ethereum ecosystem, security technologies
+suchasbytecodedecompilation,knownvulnerabilitysigna-
+ture detection, and malicious code homology analysis have
+developed rapidly. The cornerstone of all these downstream
+tasks is a core judgment problem: how to quantitatively
+evaluate the semantic equivalence between two pieces of
+EVM bytecode.For example,after pseudo-codeoutput by a
+decompiler is recompiled, equivalence comparison with the
+original bytecode is needed to verify restoration quality; a
+vulnerability matching engine needs to determine whether
+an unknown bytecode fragment has the same attack se-
+mantics as known malicious logic. Empirical studies have
+shownthatmorethan96%ofcontractsonEthereumcontain
+duplicatecode,about9.7%ofduplicatecontractscontainthe
+same vulnerabilities (He, Wu, Wang, Guo and Jiang, 2020),
+the contract-level clone ratio reaches 79.2% (Kondo, Oliva,
+Jiang, Hassan and Mizuno, 2020), and code reuse patterns
+in the contract ecosystem have also been systematically
+characterized(Chen,Liao,Zhang,HuangandZheng,2021b;
+Sun, Xu, Liu, Li and Liu, 2023).
+However,existingresearchdirectlyadoptsstructuralap-
+proximation metrics such as opcode edit distance, bytecode
+∗Corresponding author: ZiBin Zheng
+lxiao@xmut.edu.cn(L. Xiao);zzb3886290@163.com(Z. Zheng);
+zxy202302@163.com(X. Zhou);2475073732@qq.com(Y. Cai)
+ORCID(s):
+similarity,andcontrol-flowgraph(CFG)isomorphism.This
+approach is efficient and direct, but has two systematic
+biases:
+1. False-negative bias, i.e., equivalence missed detec-
+tion: the same Solidity source code compiled under
+different compiler versions, optimization levels, and
+metadata configurations can differ greatly in opcode
+sequence, basic-block partitioning, and jump struc-
+ture, while its execution semantics are completely
+equivalent. In this case, metrics that judge similarity
+based on structure will incorrectly determine that the
+two are inconsistent.
+2. False-positive bias, i.e., non-equivalence false alarm:
+fortwopiecesofbytecodewithhighlysimilaropcode
+sequences, a difference in only one key call instruc-
+tion, storage operation, or conditional jump can lead
+to completely opposite business logic and security
+properties. In this case, metrics relying on structural
+features will incorrectly determine that the two are
+consistent.
+The above problems cause systematic bias in evaluation
+systems based on structural metrics: results from different
+decompilation studies under different compilation configu-
+rations are often not horizontally comparable; the so-called
+“improvement in decompilation quality” may only be over-
+fitting of a model to compiler-specific structural features,
+rather than progress in true semantic recovery capability.
+Anonymous:Preprint submitted to ElsevierPage 1 of 22
+
+--- PAGE 2 ---
+SITM
+Existing alternative paths face irreconcilable contradic-
+tions. One class of methods uses formal verification such as
+symbolic execution and model checking for strict semantic
+equivalenceproofs,e.g.,Oyente(Luu,Chu,Olickel,Saxena
+and Hobor, 2016) and Mythril (ConsenSys, 2017). Such
+methods are logically rigorous, but suffer from state-space
+explosion and path-constraint solving bottlenecks, with ex-
+tremely high computational cost, and cannot be applied in
+batches to large-scale datasets with hundreds of thousands
+ofsamples.Anotherclasscontinuestousestructuralmetrics
+supplemented by a small amount of manual spot checking,
+whichisnotonlycostlyandsubjective,butalsocannotserve
+as a unified criterion for automated evaluation.
+Recent frontier work has attempted to extract byte-
+code semantics through different technical routes. Smart-
+Trans (Chen, Wang, Zhou, Wong, Wang and Zhang, 2025b)
+proposes a jump-aware Transformer that encodes control-
+flow information into the attention mechanism, achieving
+function-level Recall@1 of 83.54% and contract-level Re-
+call@1 of 97.41% on the ten-thousand-scale Clone-Test
+pool. Esim (Chen, Ji, He, Wu and Zhou, 2025c) extracts
+bytecode semantics through stable semantic graphs and
+heterogeneous graph neural networks. However, the field
+still lacks a standardized static metric benchmark with low
+computational cost, task-specific-training-free operation,
+and precise interpretability. To address this gap, this paper
+proposestheSITMframeworkandsystematicallyverifiesits
+effectiveness through four controlled experiments, one real
+downstream task validation, and one ablation analysis. The
+main contributions are as follows:
+•Bias quantification and problem modeling: we sys-
+tematically decompose the sources by which tradi-
+tional structural metrics are affected by compilation
+configurations, quantify the interference of different
+compiler versions, optimization levels, and metadata
+on edit distance and CFG isomorphism, and point
+out the inherent blind spot of three-layer independent
+sequenceschemesincross-layercausaldependencies.
+•Static interleaved trace method: we propose a uni-
+fied operational trace SIT interleaved according to
+the static layout order of bytecode, which unifies ex-
+ternal calls, storage accesses, event emissions, and
+exceptional reverts into a typed event sequence; a
+type-weighted edit distance based on globally fixed
+calibration weights guarantees metric symmetry, and
+layer existence is naturally handled by the trace con-
+struction process without explicit gating.
+•Multi-dimensionalsystematicvalidation:throughfour
+controlled experiments on compiler optimization ro-
+bustness, cross-version stability, predefined source-
+level mutation sensitivity, and noise robustness, plus
+a real downstream task validation on LLM decompi-
+lationqualityassessmentandanablationanalysis,we
+systematicallyverifythestabilityandeffectivenessof
+the method, and fairly compare it with three struc-
+tural baselines, one structural fusion baseline, one
+embedding baseline, and one open-source bytecode-
+level supervised Transformer baseline, SmartTrans.
+•Bounded soft-gating correction: we apply a bounded
+nonlinear penalty to the call-layer subsequence. For
+systematicmulti-pointcallhijacking,ittradesanAUC
+loss of about 0.015 for improving CH detection from
+52% to 91%, demonstrating its substantial contribu-
+tion to detecting systematic call redirection; single-
+point call hijacking is not covered and is discussed
+separately as a boundary case.
+2. Related Work
+2.1. Smart Contract Decompilation and
+Evaluation
+The methodological origin of smart contract decompi-
+lation lies in binary program analysis. Foundational work
+on binary decompilation (Cifuentes and Gough, 1995),
+semantics-preserving structural analysis and control-flow
+reconstruction (Brumley, Lee, Schwartz and Woo, 2013;
+Yakdan, Eschweiler, Gerhards-Padilla and Smith, 2015)
+establishedthebasicpathofreconstructinghigh-levelstruc-
+tures from low-level code. After deep learning entered this
+field, RNN-based neural decompilation (Katz, Ruchti and
+Schulte,2018),end-to-endneuralprogramdecompilers(Fu,
+Chen,Liu,Chen,Tian,KoushanfarandZhao,2019),decom-
+pilation enhancement for optimized binaries (Cao, Liang,
+Chen and Hu, 2022), and function signature inference with
+injectedcompileroptimizationknowledge(Lin,GaoandLo,
+2022) appeared successively. These works established the
+basic form of the decompilation problem, but none treated
+the measurement ruler itself as the research object.
+The contract decompilation work most related to this
+papercanbedividedintothreecategoriesbytechnicalroute.
+The static structure reconstruction route is represented
+byrule-basedanddeclarativeanalysis.EthIR(Albert,Gordillo,
+Livshits, Rubio and Sergey, 2018) builds a rule-based in-
+termediate representation, providing a scalable IR founda-
+tion for high-level bytecode analysis. Gigahorse (Grech,
+Brent,ScholzandSmaragdakis,2019)reconstructsfunction
+boundaries and control flow with declarative logic pro-
+gramming,liftingbytecodeintoathree-addresscode(TAC)
+intermediate representation. Elipmoc (Grech, Lagouvar-
+dos, Tsatiris and Smaragdakis, 2022) introduces transaction
+context sensitivity and improves the handling of internal
+function merging. Such tools have relatively high structural
+recognition accuracy, but their output remains low-level
+pseudo-code, and high-level semantic recovery is limited.
+They prove that bytecode can be stably decomposed and
+lifted,butdonotdiscusswhetherthestructuralmetricsused
+to evaluate their output drift with compilation configura-
+tions.Thisisexactlytheconnectionpointbetweenthispaper
+and this route.
+The learning-driven function and type recovery route
+is represented by neural networks. In function boundary
+identification, BYTEWEIGHT (Bao, Burket, Woo, Turner
+and Brumley, 2014) was the first to replace manual rules
+Anonymous:Preprint submitted to ElsevierPage 2 of 22
+
+--- PAGE 3 ---
+SITM
+with machine learning to identify binary functions and au-
+tomatically learn key features. Neural-FEBI (He, Li, Wang,
+Cheung, Zhao and Yang, 2023) extends the two-level bi-
+LSTM + CRF architecture to EVM bytecode, achieving
+function entry F1 of 88.3%–99.7% and boundary identifica-
+tion F1 of 84.6%–97.1%. FIRE (Sun, Bao and Yang, 2025)
+introduces CFG graph neural networks to enhance general-
+izationacrosscontractversions.Intypeinference,DeepInfer
+(Zhao, Li, Li, Ye, Luo and Chen, 2023) uses IR lifting, a
+two-stage inference framework, and GAT to learn CFGs,
+and infers function signatures and return values with high
+precision. DIRTY (Chen, Lacomis, Schwartz, Le Goues,
+Neubig and Vasilescu, 2022) predicts variable names and
+types simultaneously based on a Transformer. StateFormer
+(Pei,Guan,Broughton,Chen,Yao,Williams-KingandJana,
+2021) recovers binary types with generative state model-
+ing. VarLifter (Li, Song and Huang, 2024) recovers typed
+information of Solidity variables from the perspective of
+static analysis. Such methods achieve obvious accuracy im-
+provements on their respective tasks, but have two common
+limitations: they depend on fixed training datasets and have
+limited generalization to new contracts, new compiler ver-
+sions, or new languages; and the methods themselves do
+notprovidesystematicevaluationofcompiler-configuration
+robustness. Methods based on manual heuristics such as
+SigRec(Chen,Li,Luo,Wang,Wang,HeandZhang,2021a)
+have high accuracy under specific compiler versions but
+fail after version upgrades, which highlights the urgency
+of the compiler-configuration robustness problem from the
+oppositeside.Theaboveworkspursuesingle-pointaccuracy
+of decompilation output, whereas SITM pursues stability of
+theevaluationrulerunderconfigurationchanges.Theirgoals
+are different.
+The large language model route is the latest develop-
+ment. DiSCo (Su, Liang, Wu, Niu, Xu and Zhong, 2025)
+proposes a logic-invariant intermediate representation, i.e.,
+semantic units, combines a type-aware GNN to infer vari-
+able names and synthesize prompts, and lifts bytecode into
+compilable Solidity. SuiGPT MAD (Chen, Tang, Xiao, Li,
+Li, Wu and Chalkias, 2025a) extends LLM decompilation
+to the Move ecosystem. David et al. (David, Zhou, Song,
+Gervais and Qin, 2025) adopt a three-address code inter-
+mediate representation and LoRA fine-tuning of Llama-
+3.2-3B. SmartHalo (Liao, Nan, Gao, Liang, Hao, Ren and
+Zheng, 2025) restores function boundaries, variable types,
+and contract properties through fine-grained dependency
+graphs and LLM collaborative optimization of decompi-
+lation output. LLM4Decompile (Tan, Luo, Li and Zhang,
+2024)proposesend-to-endandrefinedbinarydecompilation
+strategies. Such methods have strong semantic recovery
+capability,butoutputqualityassessmentstillhighlydepends
+on the rationality of metrics. Although a small amount of
+evaluation work has begun to consider dimensions such
+as compilability, ABI recovery, and differential replay, the
+compilation-configuration bias of the metric itself has not
+beensystematicallydiscussed.SITMdoesnotcompetewith
+decompilation methods on accuracy; instead, it provides a
+low-cost, task-specific-training-free, interpretable static se-
+mantic approximate metric ruler.
+2.2. Bytecode Equivalence Metrics
+Code clone detection has systematic surveys in tradi-
+tional languages (Roy and Cordy, 2007), and the capability
+boundary of smart contract clone detection has also been
+systematically evaluated (Wang, Wan, Chen, Zhang, Lo,
+Xie and Yang, 2025). Recent techniques, applications, and
+challengesofsourcecodesimilaritymeasurementandclone
+detection have also been systematically reviewed (Zakeri-
+Nasrabadi, Parsa, Ramezani, Roy and Ekhtiarzadeh, 2023).
+Existing bytecode equivalence metrics are mainly divided
+into three categories:
+•String-level metrics: the most commonly used is nor-
+malized opcode edit distance. It is simple to compute
+butextremelysensitivetocompilationconfigurations,
+and is widely used in decompilation effect evaluation
+andcontractclonedetection.OpcodeN-gramsimilar-
+ity is also widely used for large-scale contract clone
+detection(Ragkhitwetsagul,KrinkeandClark,2018);
+its essence is local frequency features.
+•Structure-level metrics: including control-flow graph
+isomorphism,basic-blockmatchingrate,andfunction
+signature matching rate. They are more stable than
+string metrics, but still significantly affected by com-
+piler optimization.
+•Function-level metrics: compilation pass rate and in-
+terface matching rate. They can only verify syntactic
+correctness and surface matching, and cannot verify
+deep semantics.
+The above metrics are essentially structural approxima-
+tion metrics, and their core assumption that “similar struc-
+ture implies semantic equivalence” has never been strictly
+verified. A few works introduce manual evaluation as a
+supplement,butthecostishighandthesamplesizeissmall,
+so they cannot serve as standardized metrics.
+Inthedeeplearningdirection,someworksattempttouse
+GNNsorTransformerstoencodeCFGsoropcodesequences
+intoembeddingvectorsandthencomputedistances.Forex-
+ample,thestructuralcodeembeddingrouteencodesopcode
+sequences into fixed-dimensional vectors and computes co-
+sine similarity (Gao, Jiang, Xia, Lo and Grundy, 2020); the
+interpretable graph embedding route encodes control flow
+and code structure into graph vectors and gives attributable
+similarity (Liu, Ma, Mu, Wei, Xu, Jiao and Ren, 2025).
+In the bytecode-level supervised Transformer direc-
+tion, the closest work is SmartTrans (Chen et al., 2025b).
+SmartTrans introduces a Jump Target Prediction (JTP) pre-
+training task on the BERT architecture, encodes control-
+flow information into the Transformer attention mechanism
+through parameter-shared jump embeddings, and then fine-
+tunes function embeddings with contrastive learning. Its
+paper reports function-level similarity retrieval Recall@1
+of 83.54% and contract-level Recall@1 of 97.41%, and
+Anonymous:Preprint submitted to ElsevierPage 3 of 22
+
+--- PAGE 4 ---
+SITM
+validates large-scale retrieval capability on a million-level
+function pool, and validates large-scale retrieval capability
+onamillion-levelfunctionpool.SmartTransprovidesapre-
+trained model based on Ethereum bytecode, with data up to
+September 2023, and both code and data are open-sourced.
+However, SmartTrans relies on large-scale supervised fine-
+tuning,inferencerequiresGPUsupport,anditsembeddings
+areblack-box,makingitimpossibletopreciselyattributethe
+source of differences.
+Another related work, Esim (Chen et al., 2025c), pro-
+poses a Stable Semantic Graph (SSG). By retaining only
+high-semantic-relatedinstructionssuchasSSTORE,SLOAD,
+LOG,CALL,RETURN, it constructs a Stable Control-Flow
+Graph (SCFG) and a Stable Data-Flow Graph (SDFG),
+where the SDFG establishes source-sink edge relations
+through backward taint analysis, and then uses a hetero-
+geneous graph neural network (Siamese GNN) to encode
+embeddings and compute cosine similarity. Esim reports
+an AUC of 96.3% for equivalent-pair identification in the
+original paper, but has three limitations: (1) it requires
+a large amount of labeled data to train the GNN, and
+has out-of-distribution degradation risk for new compiler
+optimizations;(2)SSGconstructionrequiresbackwardtaint
+analysis and function boundary recovery, taking about 26
+secondspercontract,makingitdifficulttoscaletohundreds
+of thousands of contracts; (3) the prototype system is not
+open-sourced, so fair quantitative reproduction under the
+same dataset and evaluation protocol cannot be performed.
+Therefore, this paper treats Esim as a qualitative reference
+forthebytecode-levelsupervisedgraphlearningroute,cites
+itsreportedmetricsinrelatedworkanddiscussion,anddoes
+not include it in the experimental comparison table. The
+quantitativesupervisedbaselineadoptstheopen-sourceand
+reproducible SmartTrans.
+In the semantic clone detection direction, EClone (Liu,
+Yang, Liu, Jiang, Zhao and Sun, 2018) proposes semantic
+clone detection based on symbolic transaction sketches.
+For bytecode similarity across optimizer options and com-
+piler versions, existing work uses triplet networks to learn
+configuration-robustrepresentations(Zhu,Yue,Pang,Zhou,
+Han and Liu, 2022). Compared with the above two types
+of methods, SITM abandons graph structures and training
+dependencies,reducessemanticeventstoaone-dimensional
+static interleaved sequence, and computes similarity with
+a globally prior-weighted edit distance. This engineering
+compromiseformsacomplementarypositioninfiveaspects:
+model-training-free, requiring no labeled data; low compu-
+tational cost, O(n) linear scanning; white-box interpretabil-
+ity, allowing precise tracing of layer-wise differences from
+the edit-distance alignment matrix; zero input dependency,
+requiring no source code and directly operating on on-chain
+bytecode; and friendliness to closed-source contracts, since
+more than 99% of contracts on-chain do not disclose source
+code (Chen, Zhang, Li, Luo, Wang, Cao and Zhang, 2019),
+which source-level methods cannot cover.
+2.3. Program Semantic Equivalence Verification
+Strict methods for program semantic equivalence are
+based on formal verification, including symbolic execution,
+model checking, and logical reasoning. Symbolic execution
+has been widely used in smart contract security analysis,
+such as Oyente (Luu et al., 2016) and Mythril (ConsenSys,
+2017), but is limited by state-space explosion and difficult
+to apply in batches to large-scale contract datasets. Recent
+empirical studies also systematically evaluate the impact of
+Solidity versions on vulnerability detection tools (Iuliano,
+Corradini,Pasqua,CeccatoandDiNucci,2025).Suchmeth-
+ods are theoretically rigorous, but the computational cost is
+extremely high, and they are only suitable for small code
+fragments, not for batch evaluation of large-scale decompi-
+lation datasets.
+This paper does not pursue strict formal equivalence
+proof. Instead, for large-scale bytecode analysis scenarios,
+it proposes an approximate but stable, low-cost, compiler-
+configuration-robust operational semantic metric, greatly
+improving the robustness of semantic evaluation at an ac-
+ceptable cost. Current analysis tools are highly heteroge-
+neous. SmartBugs 2.0 provides a unified execution frame-
+work for 19 tools, supporting three input modes: source
+code, creation bytecode, and runtime bytecode (Di An-
+gelo, Durieux, Ferreira and Salzer, 2023). Orthogonal to
+formal reasoning routes, dynamic analysis and differential
+fuzzing execute candidate bytecode under the same inputs
+and compare runtime behavior to determine semantic con-
+sistency. The conclusions are closer to real semantics, but
+an executable environment and transaction generation are
+required, and the cost grows linearly with the number of
+contracts,makingitdifficulttocoverhundredsofthousands
+of contracts. Code clone detection methods based on pro-
+gram dependence graphs (PDGs) and deep learning have
+also been systematically reviewed in traditional languages
+(RoyandCordy,2007;Zakeri-Nasrabadietal.,2023).SITM
+occupies the position of “static, task-specific-training-free,
+batch-capable” in this spectrum, complementing dynamic,
+symbolicexecution,andPDGmethodsincost,accuracy,and
+interpretability, rather than replacing them.
+3. Method
+3.1. Problem Definition and Bias Analysis
+For two EVM bytecodes𝐵𝑎 and𝐵 𝑏, SITM attempts
+to approximate the following externally observable opera-
+tional semantic equivalence relation: within the statically
+extractable range, the event traces of the two pieces of
+bytecode are consistent in four dimensions. This definition
+does not constitute a formal equivalence proof, nor does it
+cover dynamically untraceable scenarios:
+1. The target address, call type, function selector, ar-
+gument count, and value-transfer flag of all external
+contract calls are consistent;
+2. The base slot number, read/write mode, and access
+order of contract storage slots are consistent;
+Anonymous:Preprint submitted to ElsevierPage 4 of 22
+
+--- PAGE 5 ---
+SITM
+3. The event signature topic0, topic count, and data
+length of all event logs are consistent;
+4. The occurrence patterns of key exceptional revert
+instructions REVERT and INVALID are consistent.
+SITMfocusesonexternallyobservableexecutionbehav-
+ior, rather than the specific organization of internal instruc-
+tionsandstackoperationdetails.Itdoesnotdeterminestrict
+formal equivalence, but provides an operational semantic
+approximatemetricthatcanbecomputedinbatchesinlarge-
+scale scenarios.
+The applicable boundary of SITM is also given. This
+metric is suitable for contracts dominated by external inter-
+actions, such as asset contracts and DeFi protocols. It is not
+suitable for three scenarios: (1) pure internal computation
+mutations, i.e., mutations that only involve internal mathe-
+matical operations without changing external calls, storage
+baseslots,eventsignatures,andexceptionpatternscannotbe
+detected;(2)contractsdominatedbydynamicaddressesand
+dynamic slots, when call targets and storage slots cannot be
+statically traced, key fields fall into[DYN_*]wildcard mark-
+ers, and events degenerate into type-level coarse-grained
+matching;(3)contractswithdeeploopsandnestedbranches,
+where static layout order and dynamic execution order may
+deviate severely, and the detection rate of reentrancy-type
+mutations decreases.
+The bias of traditional opcode edit distance and CFG
+isomorphism comes from three compilation aspects:
+1. Compiler version differences: different versions of
+solcdifferininstructionselection,stackoptimization,
+memory layout, and security-check injection.
+2. Optimizerconfiguration:afterenablingtheoptimizer,
+constant folding, dead code elimination, loop un-
+rolling,andfunctioninlininggreatlychangebytecode
+structure.
+3. Metadataattachment:theSwarm/IPFShashandCBOR
+metadataareaappendedattheendofbytecodedirectly
+cause systematic bias in edit distance.
+Together,thesemakestructuralsimilarityavariablethat
+drifts with compilation configuration and cannot serve as a
+stable ruler for semantic equivalence.
+On the other hand, if external calls, storage accesses,
+and event emissions are separated into three independent
+sequences and their edit distances are computed separately,
+the relative layout order between CALL and SSTORE is
+completelylost. Thisisexactly thefundamentalreasonwhy
+semantic mutations such as the destruction of the Checks-
+Effects-Interactionspatterninreentrancyattacksaredifficult
+to detect.
+Figure 1 uses a typical Soliditywithdrawfunction as an
+example to intuitively show the above bias sources. The
+source code is compiled by solc 0.5.17 with optimization
+off, solc 0.8.20 with optimization off, and solc 0.8.20 with
+optimization on, generating three bytecodes of lengths 666
+B, 934 B, and 431 B, respectively. Although the source
+semantics are completely consistent, the opcode sequences
+Figure 1:Bytecode-level example of compilation configuration
+bias.
+differsignificantlyininstructionselection,stackoperations,
+memory layout, and jump structure: version 0.5.17 uses
+instructions such asPUSH1 0x00,DUP,SLOAD, andSSTOREto
+completestatereadingandwriting;the0.8.20optimization-
+offversioninsertsadditionalinstructionssuchasPUSH0,SWAP,
+andINVALID, increasing the length to 934 B; the 0.8.20
+optimization-onversioncompressesitto431Bthroughcon-
+stantfolding,deadcodeelimination,andstackoptimization.
+Dashed lines in the figure mark instruction fragments with
+semantic correspondence across versions, but their posi-
+tions,contexts,andquantitieshaveallchangedsignificantly.
+If opcode edit distance or CFG isomorphism is directly
+computed, the same source code will be judged as having
+low similarity due to different compilation configurations,
+producingfalse-negativebias.Fromtheperspectiveofexter-
+nally observable operational semantics, all three bytecodes
+contain the core event sequence “readbalances[msg.sender]
+→writebalances[msg.sender]→initiatecall.valuecall
+→emitWithdrawevent,” and the relative order in which
+SSTORE is before CALL and LOG2 is at the end is not
+changed by the compilation configuration. This is exactly
+the design basis for SITM to construct a static interleaved
+trace, filter internal instruction perturbations, and preserve
+cross-layereventorder.Althoughmetadataattachmentisnot
+shown in Figure 1, it further exacerbates edit-distance bias,
+and its impact is uniformly stripped in preprocessing.
+3.2. Overview of the SITM Framework
+The core design idea of SITM is that compiler opti-
+mization and version differences mainly change internal
+executiondetailsandstackoperations,withoutchangingthe
+contract’s external operational semantics, and should not
+disrupttherelativeorderofkeysemanticeventsinthestatic
+bytecode layout. Based on this, SITM no longer separates
+semantic layers into independent sequences, but constructs
+a Static Interleaved Trace (SIT) interleaved according to the
+static layout order of bytecode.
+In this paper, a static interleaved trace refers to a single
+sequence of typed events. Each event is labeled as one of
+fivesemantictypes—call,store,log,exc,orret—andevents
+are interleaved according to their static layout order in the
+Anonymous:Preprint submitted to ElsevierPage 5 of 22
+
+--- PAGE 6 ---
+SITM
+Figure 2:Overview of the SITM framework.
+bytecode,ratherthanbeingseparatedintoindependentlayer-
+wise sequences for similarity computation.
+SIT records the static occurrence order of events in the
+linear bytecode scan, rather than the dynamic execution or-
+derafterjumps,loops,andbranchesduringEVMruntime.In
+straight-linecodepathswithoutloops,thestaticlayoutorder
+isconsistentwiththeexecutionorder;inthepresenceofloop
+bodiesorconditionalbranches,thetwomaydeviate.Thisisa
+compromise under O(n) linear cost. Precise execution order
+requires CFG topological order or symbolic execution, with
+a significant increase in cost.
+The overall process is shown in Figure 2: (1) the pre-
+processing stage strips metadata and completes variable-
+lengthinstructiondisassemblyandbasic-blockpartitioning;
+(2) lightweight local stack backtracking extracts events; (3)
+events are interleaved into SIT according to static layout
+order; (4) the trace similarity𝑆𝑡𝑟𝑎𝑐𝑒 is computed by type-
+weighted edit distance based on globally fixed calibration
+weights; (5) the call subsequence is extracted to compute
+𝑆𝑐𝑎𝑙𝑙, and a nonlinear penalty𝑔is obtained through soft
+gating; (6) the final score is output.
+3.3. Static Interleaved Trace Construction
+Preprocessing uniformly performs the following steps,
+and all baselines also run under the same preprocessing:
+1. Metadata stripping: identify and strip the standard
+CBOR/Swarm/IPFS metadata area at the end of byte-
+code.
+2. Variable-length disassembly: linearly scan according
+to the EVM instruction set specification, skip data
+bytes following PUSH-family instructions, and avoid
+misjudging data as opcodes.
+3. Basic-blockpartitioning:usejumptargetsofJUMP/JUMPI
+and fall-through boundaries of linear scanning as ba-
+sic blocks; dynamic jumps, i.e., targets from runtime
+computation,areregardedasunresolvablejumps,and
+thecontainingbasicblockispartitionedbylinearscan
+boundaries.
+4. Stack backtracking: initialize an empty virtual stack
+inside each basic block, and simulate stack opera-
+tionsinstructionbyinstructionforward.Forconstants
+resolvable within the block, including PUSH direct
+pushes and same-block computed constants, extract
+their static values; for dynamic values passed across
+blocks or loaded from memory, mark them as[DYN]
+symbols.
+This design strictly limits the scope of symbolic execu-
+tion to a single basic block, avoiding cross-block control-
+flow explosion. In contrast, Vandal provides a register-style
+intermediate representation (Brent, Jurisevic, Kong, Liu,
+Gauthier, Gramoli, Holz and Scholz, 2018), precise static
+modeling of EVM memory requires higher cost (Lagouvar-
+dos, Grech, Tsatiris and Smaragdakis, 2020), and methods
+that parse jumps and build precise CFGs based on symbolic
+execution are also expensive (Contro, Crosara, Ceccato and
+Dalla Preda, 2021); SITM chooses local stack backtracking
+within basic blocks rather than a complete register-style IR,
+which is an engineering compromise between precision and
+batch computability.
+During basic-block traversal, whenever a semantic key
+instruction is encountered, operands are extracted from the
+current virtual stack to generate an event. There are five
+types.
+(1) Call event, triggered by CALL, CALLCODE, DEL-
+EGATECALL, STATICCALL:
+𝑒𝑣𝑐𝑎𝑙𝑙 =(𝜏 𝑐𝑎𝑙𝑙, 𝜅, 𝛿, 𝜙, 𝑣)
+where𝜏 𝑐𝑎𝑙𝑙 is the call opcode type;𝜅is the target ad-
+dress, taking a constant when statically traceable, otherwise
+Anonymous:Preprint submitted to ElsevierPage 6 of 22
+
+--- PAGE 7 ---
+SITM
+[DYN_ADDR];𝛿isthefunctionselector,takingaconstantwhen
+traceable within the block, otherwise[DYN_SEL];𝜙is the
+argument length, taking a numerical value when traceable,
+otherwise[DYN_LEN]; and𝑣is the value-transfer flag, taking
+0, 1, or[DYN_VAL].
+(2) Storage event, triggered by SLOAD, SSTORE:
+𝑒𝑣𝑠𝑡𝑜𝑟𝑒=(𝑚𝑜𝑑𝑒, 𝜎𝑏𝑎𝑠𝑒, 𝜎𝑝𝑎𝑡)
+where𝑚𝑜𝑑𝑒is read or write;𝜎 𝑏𝑎𝑠𝑒 is the storage slot base
+address.Adirectslotnumbertakesaconstant;formappings
+anddynamicarrayslotsoftheformkeccak(k,base),thebase
+slot constant is extracted; when completely untraceable, it
+is[DYN_SLOT];𝜎 𝑝𝑎𝑡 is the access mode label, taking direct,
+mapping, array, or[DYN].
+(3) Log event, triggered by LOG0–LOG4:
+𝑒𝑣𝑙𝑜𝑔 =(𝑐𝑛𝑡 𝑡, 𝜎0, 𝑙𝑒𝑛𝑑)
+where𝑐𝑛𝑡 𝑡 isthetopiccount,rangingfrom0to4,implicitly
+determined by the LOG opcode;𝜎0 is the static digest of
+topic0. When𝑐𝑛𝑡𝑡 ≥1, if topic0 is a block-traceable PUSH
+constant,itsvalueistaken;otherwiseitis[DYN_TOPIC];when
+𝑐𝑛𝑡𝑡=0,itisrecordedasN/A;𝑙𝑒𝑛 𝑑 isthedatalength,taking
+a numerical value when traceable, otherwise[DYN_DLEN].
+(4) Exception event, triggered by REVERT, INVALID;
+SolidityassertfailuresareusuallymappedtoINVALIDafter
+compilation:
+𝑒𝑣𝑒𝑥𝑐 =(𝜖, 𝑝𝑐𝑜𝑛𝑑)
+where𝜖istheexceptiontype,takingREVERTorINVALID;
+𝑝𝑐𝑜𝑛𝑑 istherevertconditionpatternlabel,takingvaluessuch
+as EQ, LT, ISZERO, or unconditional.
+(5) Return event, triggered by RETURN, recording the
+data length pattern. Such events have low weight and are
+mainly used to assist function boundary localization.
+All events are interleaved into a static trace in the order
+in which they appear in the linear bytecode scan:
+𝑇=[𝑒 1, 𝑒2,…, 𝑒 𝑛]
+Eacheventcarriesatypelabel𝜏(𝑒𝑣)∈{𝑐𝑎𝑙𝑙,𝑠𝑡𝑜𝑟𝑒,𝑙𝑜𝑔,𝑒𝑥𝑐,𝑟𝑒𝑡}.
+The key to this design is that the relative layout position of
+CALL and SSTORE in the static trace is preserved: when
+malicious code swaps the bytecode layout order of “transfer
+first, then write state” and “write state first, then transfer,”
+theinterleaving patternof callevents andstore eventsinthe
+two traces changes accordingly, and the type-weighted edit
+distance can capture this difference. The SIT construction
+process is shown in Algorithm 1.Here,𝐾denotes the set
+of semantic key instructions:CALL, CALLCODE, DEL-
+EGATECALL, STATICCALL, SLOAD, SSTORE, LOG0
+... LOG4, REVERT, INVALID, RETURN . The function
+EV(𝑖𝑛𝑠,𝑉𝑆)extracts fields from the virtual stack accord-
+ing to the event definitions in Section 3.3, and generates
+call/store/log/exc/ret events.
+Algorithm 1Static Interleaved Trace Construction
+1:Input:runtime bytecode𝐵
+2:Output:static interleaved trace𝑇
+3:𝐵 𝑟 ←STRIPMETA(𝐵)
+4:𝐼←DISASM(𝐵 𝑟)⊳skip PUSH data bytes
+5:𝐵𝐵←SPLITBLOCKS(𝐼)⊳jump targets & fall-through
+6:𝐵𝐵←SORTBYSTARTOFFSET(𝐵𝐵)
+7:𝑇←∅
+8:foreach𝑏𝑏∈𝐵𝐵in linear orderdo
+9:𝑉𝑆←∅
+10:foreach𝑖𝑛𝑠∈𝑏𝑏do
+11:if𝑖𝑛𝑠∈𝐾then
+12:𝑇←APPEND(𝑇,EV(𝑖𝑛𝑠,𝑉𝑆))⊳extract
+from pre-execution stack
+13:end if
+14:𝑉𝑆←STEP(𝑉𝑆,𝑖𝑛𝑠)⊳constants or[𝐷𝑌𝑁]
+15:end for
+16:end for
+17:return𝑇
+3.4. Natural Handling of Layer Existence and
+Globally Fixed Calibration Weights
+Under the SIT framework, layer existence is naturally
+handled by the trace construction process: if the number of
+events of a certain type is zero, i.e., the contract has no such
+instructions,thennoeventsaregeneratedandtheynaturally
+do not appear in the trace. For example, a pure computation
+contracthasnoCALLinstruction,sotherearenocallevents
+in the trace, and the edit distance automatically compares
+only the store/log/exc layers, without artificially penalizing
+the “missing call layer.”
+Empty-trace convention: if both traces are empty—this
+situation theoretically occurs only in extreme contracts with
+no CALL, SLOAD/SSTORE, LOG, REVERT/INVALID,
+or RETURN—𝑆𝑡𝑟𝑎𝑐𝑒 is defined as 1; if only one trace is
+empty,𝑆 𝑡𝑟𝑎𝑐𝑒 is forced to 0. This is a special convention
+thatoverridesthegeneralformula.Thedifferencebetweena
+non-empty trace and an empty trace cannot be measured by
+eventtypematching,andtheyaredirectlyjudgedcompletely
+inconsistent.
+To guarantee the symmetry of the type-weighted edit
+distance𝑆(𝐴,𝐵) =𝑆(𝐵,𝐴), the operation costs of the
+edit distance use a set of globally fixed calibration weights,
+identical for any two traces to be compared:
+̄𝑤𝜏 = exp(𝛼𝜏)∑
+𝜏′exp(𝛼𝜏′)
+where𝛼 𝑐𝑎𝑙𝑙 = 1.8,𝛼𝑠𝑡𝑜𝑟𝑒 = 0.6,𝛼𝑙𝑜𝑔 = 0.3,𝛼𝑒𝑥𝑐 = 0.5,
+and𝛼 𝑟𝑒𝑡 = 0.1. Substituting yields̄𝑤𝑐𝑎𝑙𝑙 = 0.505,̄𝑤𝑠𝑡𝑜𝑟𝑒 =
+0.152, ̄𝑤𝑒𝑥𝑐 =0.138, ̄𝑤𝑙𝑜𝑔 =0.113, and ̄𝑤𝑟𝑒𝑡 =0.092, with
+maximum weight̄𝑤max=0.505.
+Theabovevaluesaresearchresultsonthecalibrationset,
+as shown in Table 2.
+Theweightorderingcorrespondstotheroleofeachlayer
+inassetsecurity:externalcallsdetermineassetflowsandare
+theanchorofcontracttrustassumptions;tamperingwiththe
+Anonymous:Preprint submitted to ElsevierPage 7 of 22
+
+--- PAGE 8 ---
+SITM
+target or selector means direct loss of asset control. Storage
+access determines state consistency and is the core point
+of reentrancy and state hijacking. Exceptional reverts de-
+termine rollback protection for funds and operations. Event
+logs serve off-chain observation and do not directly change
+assets. Returns are only used to assist function boundary
+localization.Inthecorpus,theaveragenumberofeventsper
+contract is store 21.4, log 11.8, ret 9.2, call 8.6, and exc 4.7,
+showing that event frequency and security weight are not
+equivalent.Theweightsencodeconsequenceseverityrather
+than occurrence frequency. This set of weights implicitly
+encodes inter-layer importance through edit-distance costs,
+rather than entering the final formula as explicit fusion
+coefficients.
+After computing the full trace edit distance, subse-
+quences of each event type can be extracted from the
+alignmentmatrix,andthelayer-wisesubsequencesimilarity
+can be computed separately:
+𝑆𝜏 =1−
+levenshtein(𝑇(𝜏)𝐴 , 𝑇(𝜏)𝐵 )
+max(len(𝑇(𝜏)𝐴 ),len(𝑇 (𝜏)𝐵 ))
+where𝑇 (𝜏) isthesubsequenceofeventsoftype𝜏inthetrace.
+Within the same subsequence, event weights are all ̄𝑤𝜏,
+and the type-weighted edit distance degenerates to ordinary
+Levenshtein distance on this subsequence, differing only
+by a common constant factor that cancels after normaliza-
+tion, so the ordinary Levenshtein formula is used directly.
+Apart from the call-layer soft gating, this decomposition
+does not participate in the final score and is only used for
+interpretability reporting, i.e., locating which layer mainly
+causes the difference; the contribution proportion of each
+layerinthereportisdisplayedusingthesamegloballyfixed
+weights as ̄𝑤𝜏. Empty-layer convention: if a layer is empty
+in both traces,𝑆𝜏 is defined as 1; if only one side is empty,
+it is defined as 0.
+3.5. Type-Weighted Edit Distance
+SITMcomputesthetype-weightedLevenshteindistance
+between𝑇 𝐴 and𝑇 𝐵, and operation costs depend only on
+globally fixed calibration weights:
+𝑑𝑖𝑛𝑠𝑒𝑟𝑡(𝑒𝑣)=𝑑 𝑑𝑒𝑙𝑒𝑡𝑒(𝑒𝑣)= ̄𝑤𝜏(𝑒𝑣)
+𝑑𝑠𝑢𝑏𝑠𝑡(𝑒𝑣𝑎, 𝑒𝑣𝑏)=max( ̄𝑤𝜏(𝑒𝑣𝑎), ̄𝑤𝜏(𝑒𝑣𝑏))⋅𝟙[𝑒𝑣 𝑎 ≠𝑒𝑣 𝑏]
+When two events are completely identical, the substitution
+cost is 0; when different, the substitution cost is the larger
+of their weights. This design guarantees that the triangle
+inequality holds, and all operation costs do not exceed the
+global maximum weight̄𝑤max=0.505.
+Two events are equal if and only if every pair of corre-
+sponding fields is equal: the two sides have the same value,
+or the field is a wildcard marker on both sides; wildcard
+markers in different fields are not considered equal. To
+make the normalized similarity fall between 0 and 1, the
+denominator takes the theoretical maximum possible edit
+distancemax(len(𝑇 𝐴),len(𝑇 𝐵))× ̄𝑤max:
+𝑆𝑡𝑟𝑎𝑐𝑒 =1− 𝑊𝐿𝐷(𝑇𝐴, 𝑇𝐵)max(len(𝑇𝐴),len(𝑇 𝐵))× ̄𝑤max
+Since𝑊𝐿𝐷≤max(len) × ̄𝑤max, we always have0≤
+𝑆𝑡𝑟𝑎𝑐𝑒 ≤1; because costs use globally fixed weights,
+𝑆𝑡𝑟𝑎𝑐𝑒(𝐴,𝐵) =𝑆𝑡𝑟𝑎𝑐𝑒(𝐵,𝐴)always holds.𝑆 𝑡𝑟𝑎𝑐𝑒 is the core
+similarity of SITM.
+This denominator is a conservative upper bound: most
+actualoperationcostsarelowerthan ̄𝑤max,whichmakesthe
+normalized similarity generally higher. The denominator is
+retained because it makes𝑆𝑡𝑟𝑎𝑐𝑒 strictly lie in the interval
+0 to 1, independent of weight selection, and comparable
+across datasets. To test whether the denominator choice
+affectsconclusions,thispaperperformsanormalizationsen-
+sitivity analysis: using an adaptive denominator converted
+from empirical event-type frequencies, with an equivalent
+maximumcostcoefficientofabout0.28,andrecomputingall
+samples, the Opt-Pair mean decreases from 0.9438 to about
+0.90, while the Spearman rank correlation over all samples
+is1.000,andtherelativecomparisonsandconclusionsofall
+RQs remain completely unchanged. Accordingly, the abso-
+luteSITMscoresinalltablesinthispaperaregenerallyhigh
+and are only used for relative comparison among methods
+in the same table and threshold analysis; directly citing
+absolute values across datasets is not recommended. The
+abstract and conclusion also focus on comparable metrics
+such as relative improvement, AUC, and FPR.
+3.6. Soft-Gating Correction
+Asset flows in Ethereum contracts highly depend on
+external calls. A local mutation in the target address or
+selector of a call instruction often collapses the overall trust
+assumption of the contract, e.g., assets are transferred to
+an attacker. However, standard weighted edit distance tends
+to smooth such high-dimensional local feature mutations:
+the field difference of a single call event is diluted into the
+normalizeddenominatoroftheentiretrace,andcannotform
+sufficientsingle-pointsuppression.Tothisend,SITMintro-
+duces a nonlinear penalty based on the criticality of cross-
+contract interactions, implemented as soft gating acting on
+the call-layer subsequence.
+Soft gating acts on the call-layer subsequence similarity
+𝑆𝑐𝑎𝑙𝑙, which is computed by extracting the call event subse-
+quence from SIT and using normalized edit distance:
+𝑔(𝑆𝑐𝑎𝑙𝑙)=
+⎧
+⎪
+⎪
+⎨
+⎪
+⎪⎩
+0, 𝑆 𝑐𝑎𝑙𝑙 ≥𝜃 ℎ𝑖
+𝛾⋅ 𝜃ℎ𝑖−𝑆𝑐𝑎𝑙𝑙
+𝜃ℎ𝑖−𝜃𝑙𝑜
+, 𝜃 𝑙𝑜 <𝑆 𝑐𝑎𝑙𝑙 <𝜃 ℎ𝑖
+𝛾, 𝑆 𝑐𝑎𝑙𝑙 ≤𝜃 𝑙𝑜
+where𝜃 ℎ𝑖 = 0.70,𝜃 𝑙𝑜 = 0.40, and𝛾= 0.35. Call
+subsequence empty convention: if both call subsequences
+are empty,𝑆𝑐𝑎𝑙𝑙 is defined as 1 and𝑔= 0, and no penalty
+is triggered when there is no call layer; if only one is empty,
+𝑆𝑐𝑎𝑙𝑙 = 0and𝑔=𝛾, and call-layer asymmetry is regarded
+as a severe semantic difference.
+Anonymous:Preprint submitted to ElsevierPage 8 of 22
+
+--- PAGE 9 ---
+SITM
+Table 1
+Static traceability ratio of event fields.
+Event type Field Traceability ratio Description
+call Target address𝜅31.3% Fixed-address calls; proxy contracts are mostly dy-
+namic
+call Function selector𝛿42.8% PUSH4 constant pattern is common
+call Argument length𝜙48.6% Many dynamic calldata scenarios
+call Value flag𝑣83.1% Most calls have value=0 as a constant
+store Base slot𝜎 𝑏𝑎𝑠𝑒 55.2% Direct slot numbers traceable; mapping slots extract
+base slots
+store Access mode𝜎 𝑝𝑎𝑡 64.7% keccak pattern recognizable
+log topic0𝜎 0 74.3% Event signatures are usually PUSH32 constants
+log Data length𝑙𝑒𝑛 𝑑 24.2% Many dynamic-length data
+exc Exception type𝜖100% Directly determined by opcode
+exc Condition pattern𝑝 𝑐𝑜𝑛𝑑 88.4% Most exceptions are preceded by comparison instruc-
+tions
+Algorithm 2SITM Similarity Computation—Type-
+Weighted Edit Distance and Soft Gating
+1:Input:static interleaved traces𝑇 𝐴,𝑇𝐵
+2:Output:similarity𝑆 𝑆𝐼𝑇𝑀
+3:Type-weighted edit distance:
+4:𝑊𝐿𝐷←WEIGHTEDLEVENSHTEIN(𝑇 𝐴,𝑇𝐵, ̄𝑤𝜏)
+5:Trace similarity:
+6:𝑆 𝑡𝑟𝑎𝑐𝑒 ←1− 𝑊𝐿𝐷max(|𝑇𝐴|,|𝑇𝐵|)⋅ ̄𝑤max ⊳both empty:1; one empty: 0
+7:Call-layer soft gating:
+8:𝑇 𝑐𝑎𝑙𝑙𝐴 ←EXTRACTCALLSUBSEQUENCE(𝑇 𝐴)
+9:𝑇 𝑐𝑎𝑙𝑙𝐵 ←EXTRACTCALLSUBSEQUENCE(𝑇 𝐵)
+10:𝑆 𝑐𝑎𝑙𝑙 ←NORMLEVENSHTEIN(𝑇 𝑐𝑎𝑙𝑙𝐴 ,𝑇 𝑐𝑎𝑙𝑙𝐵 )
+11:𝑔←SOFTGATING(𝑆 𝑐𝑎𝑙𝑙)⊳both empty:
+𝑆𝑐𝑎𝑙𝑙 =1,𝑔=0; one empty:𝑆 𝑐𝑎𝑙𝑙 =0,𝑔=𝛾
+12:Final score:
+13:𝑆 𝑆𝐼𝑇𝑀 ←𝑆 𝑡𝑟𝑎𝑐𝑒 ⋅(1−𝑔)
+14:return𝑆 𝑆𝐼𝑇𝑀
+Soft gating is bounded,𝑔falls between 0 and𝛾, and the
+transition width𝜃ℎ𝑖−𝜃𝑙𝑜 = 0.30determines the interval in
+which the penalty increases linearly with call-layer devia-
+tion. The final SITM score is:
+𝑆𝑆𝐼𝑇𝑀 =𝑆 𝑡𝑟𝑎𝑐𝑒 ⋅(1−𝑔)
+Since𝑔is bounded, the final score lies in[𝑆 𝑡𝑟𝑎𝑐𝑒(1 −
+𝛾), 𝑆𝑡𝑟𝑎𝑐𝑒], and soft gating does not unboundedly suppress
+normal equivalent pairs. The complete computation process
+is shown in Algorithm 2.
+3.7. Static Traceability of Event Fields
+Table 1 reports, on 24,079 benchmark bytecodes in the
+Opt-Pair evaluation set, the static traceability ratio of each
+eventfield,i.e.,theproportionofbytecodeswhosefieldtakes
+astaticvalueratherthana[DYN_*]wildcard;thedenominator
+is the number of benchmark bytecodes, counted separately
+by field.
+Fine-grained fields, i.e., selector, topic0, and base slot,
+can be statically extracted in about 30%–75% of samples,
+andtherestfallintowildcardmarkers.Ablationexperiments
+verify the actual contribution of these fields to final perfor-
+mance.
+3.8. Computational Complexity Analysis
+SITM computation consists of two parts:
+1. Trace extraction: linear scanning based on local stack
+backtracking withinbasic blocks, with timecomplex-
+ity O(n), where n is the total number of bytecode
+instructions, and space complexity depends on the
+maximum depth of the virtual stack within a single
+basic block.
+2. Similarity computation: type-weighted edit distance
+actsontracelengthm.Thetraceretainsonlysemantic
+key instructions, satisfying𝑚 ≪ 𝑛, with time com-
+plexity O(𝑚𝐴 ⋅𝑚𝐵).
+The overall engineering overhead is of the same order
+as traditional edit distance and can be applied in batches to
+large-scale datasets.
+Measured runtime: on 24,079 Opt-Pair pairs, the com-
+pleteSITMprocess,includingdisassembly,eventextraction,
+SIT construction, weighted edit distance, and soft gating,
+takes an average of 78.3 ms per pair; the runtime environ-
+mentisIntelXeonPlatinum8375C@2.9GHz,Python3.11,
+single-threaded.
+4. Experimental Design and Results
+This chapter examines SITM from three levels around
+sixresearchquestions:controlledexperiments,real-scenario
+validation, and ablation analysis. Controlled experiments
+cover four dimensions: optimizer switching, version migra-
+tion, predefined source-level mutations, and noise perturba-
+tion. Real-scenario validation uses LLM bytecode decom-
+pilation as a downstream task. Ablation analysis removes
+each component one by one to examine its independent
+contribution.
+Anonymous:Preprint submitted to ElsevierPage 9 of 22
+
+--- PAGE 10 ---
+SITM
+RQ.1(Optimizerrobustness):Compileroptimizeron/off
+switching significantly changes the internal structure of
+bytecode. Under this perturbation, is the equivalence-score
+stability of SITM significantly better than existing metrics?
+RQ.2 (Cross-version stability): When the same source
+code is compiled under different Solidity versions and byte-
+code migration occurs, how stable is the SITM score? Is
+there a difference between minor and major version spans?
+RQ.3(Predefinedsource-levelmutationsensitivity):For
+perturbed samples generated by disassembly-layer muta-
+tion operators that are structurally similar but externally
+observable operationally semantically opposite, can SITM
+effectively identify them at the classification level? How
+does performance differ across perturbation types?
+RQ.4 (Noise robustness): Under perturbations such as
+metadatanoise,junkinstructioninsertion,andinvalidPUSH
+dead code, how stable is the SITM score?
+RQ.5 (Real-scenario effectiveness): In the real applica-
+tion scenario of LLM bytecode decompilation, can SITM
+reasonablydistinguishthedecompilationqualityofdifferent
+LLMs? Is its ranking consistent with structural metrics? Is
+there a systematic difference between absolute scores and
+structural metrics?
+RQ.6(Componentcontribution):Whatrolesdothestatic
+interleaved trace, type-weighted edit distance, soft gating,
+andfine-grainedeventfieldseachplay?Howdoesremoving
+any component affect overall performance?
+4.1. Experimental Setup
+The dataset is based on SmartBugs 2.0 (Di Angelo
+et al., 2023), about 47,000 verified contract source codes,
+and ScrawlD (Yashavant, Kumar and Karkare, 2022), 6,780
+contracts. After deduplication by address and removal of
+entries that depend on deprecated compiler syntax, are du-
+plicated across sources, or cannot be compiled with the
+targetsolcversion,weobtain44,279realdeployedcontracts
+withmorethan500instructions,coveringERC20,ERC721,
+lending, auctions, voting, and other scenarios. Compilation
+versions are solc 0.5.17, 0.6.12, 0.7.6, 0.8.19, and 0.8.20,
+with optimizer off and on, and runs set to 200.
+Data splitting is performed at the contract address level,
+with random seed fixed to 42. The four subsets are mutually
+disjoint, and different compilation versions of the same
+contract do not cross subsets:
+Training set: 19,200 contracts, used only for model con-
+trastive learning fine-tuning and pre-training.
+Calibration set: 500 contracts, forming 500 optimizer
+on/off equivalence pairs, used for𝛼 𝜏 coordinate descent
+search.
+Test set: 24,079 contracts, used to construct evaluation
+samples for each group.
+Mixed validation set: 500 contracts. Each contract con-
+tributesoneoptimizeron/offequivalencepairandonemuta-
+tionpair,totaling1,000pairs(500equivalent,500mutated).
+Mutation pairs are generated by the five mutation operators
+defined in Section 4.1, 100 pairs per type. The benchmark
+contracts of the mixed validation set are independent of
+the test set, and the two groups of benchmark contracts are
+completelydisjointatthecontractaddresslevel.Usedfor𝜃,
+𝛾, threshold, SF weight, and SmartTrans tuning.
+Evaluationsamplesineachgrouparetakenfromthetest
+set:
+Opt-Pair: 24,079 pairs, each contract corresponding to a
+pair of optimizer on/off equivalent bytecodes.
+Ver-Pair: 678 pairs, pairing the earliest successfully
+compiled version with subsequent versions, including a
+minor-version migration subset of 520 pairs and a major-
+version migration subset of 158 pairs. Both subsets contain
+bytecode pairs generated from the same source code under
+different Solidity compiler versions, with the distinction
+lying in the compiler version span.
+Mut-Set:2,000pairs,including1,000negativepairsand
+1,000 equivalent positive pairs, forming a binary classi-
+fication set; negative pairs are generated by source-level
+semantic-opposite mutations, 200 pairs per type, as defined
+later.
+Noise-Set: 500 pairs, randomly sampled from Opt-Pair
+equivalent samples and injected with noise.
+The five mutation operators in this paper are direction-
+ally extended based on SuMo (Barboni, Morichetta and
+Polini, 2022) and ContractMut (Hartel and Schumi, 2020).
+CH inherits SuMo’s Address Value Replacement (AVR)
+and Ether Transfer function Replacement (ETR), extending
+single-point address replacement to systematic redirection
+of all or most call events in a contract, and supports call
+type replacement. When the call target address is statically
+traceable, it is directly replaced with an attacker address;
+whenthetargetaddressisdynamicallyuntraceableandfalls
+into[DYN_ADDR],theexternallyobservablecallsemanticsare
+changed through call type replacement, selector tampering,
+or argument length tampering. SH refers to ContractMut’s
+Qualifier for storage Replacement/Deletion (QRD), lower-
+ing the operation level from source storage qualifiers to
+SSTORE base-slot constants and access modes, and adds
+an unauthorized-write variant. When the SSTORE base slot
+is statically traceable, SH directly replaces the base-slot
+constant or inserts an unauthorized write; when the base
+slotisdynamicallyuntraceableandfallsinto[DYN_SLOT],SH
+changesexternallyobservablestoragesemanticsbyinserting
+unauthorized writes, changing read/write modes, changing
+access mode labels, or tampering with slot-computation-
+relatedconstants.PT,basedonSuMo’sInteger/Hexadecimal
+Literal Replacement (ILR/HLR) and Argument Change of
+overloaded Method call (ACM), adds AST node filtering,
+triggering replacement only when a constant appears at a
+call argument offset or length position, while keeping the
+selector unchanged. ET, based on SuMo’s Event Emission
+Deletion (EED) and ILR/HLR, specializes to the topic0
+and data length fields of LOG statements. RS, i.e., reen-
+trancy reordering, has no direct corresponding operator in
+SuMoorContractMut;itsdesignreferstothemutationlogic
+of Checks-Effects-Interactions pattern destruction in reen-
+trancy vulnerability research, swapping the order of data-
+independent SSTORE-CALL statements. All operators are
+Anonymous:Preprint submitted to ElsevierPage 10 of 22
+
+--- PAGE 11 ---
+SITM
+Algorithm 3Semantic-Opposite Mutation Generation and
+Validation
+1:In:𝑆,𝑘∈{𝐶𝐻,𝑆𝐻,𝑅𝑆,𝑃𝑇,𝐸𝑇},𝑁 𝑘=200,𝑠𝑒𝑒𝑑,𝑐𝑓𝑔
+2:Out:𝐵 ′𝑟𝑢𝑛𝑡𝑖𝑚𝑒,𝑦∈{0,1}, or⊥
+3:𝐵←COMPILE(𝑆,𝑐𝑓𝑔);𝐵 𝑟𝑡 ←STRIP(𝐵)
+4:𝐴𝑆𝑇←PARSE(𝑆);𝐶 𝑘 ←CANDS(𝐴𝑆𝑇,𝑘)
+5:ifnot PRE(𝐶 𝑘,𝑘)then
+6:return⊥
+7:end if
+8:switch𝑘do
+9:CH: redirect resolvable call targets; or CALL→DELE-
+GATECALL
+10:SH:tamperresolvableSSTOREslots;orinsertunauthorized
+write
+11:RS:swapdata-independentSSTORE-CALLonstraight-line
+paths
+12:PT: modify calldata offset/length, keep selector
+13:ET: modify LOG topic0 or data length
+14:end
+15:𝑆 ′ ←WRITEBACK(𝐴𝑆𝑇);𝐵 ′ ←COMPILE(𝑆 ′,𝑐𝑓𝑔)
+16:if𝐵 ′ fails or ABI mismatchthen
+17:return⊥
+18:end if
+19:𝐵 ′𝑟𝑡 ←STRIP(𝐵 ′)
+20:𝜉←(𝑠𝑡𝑎𝑡𝑒,𝑐𝑎𝑙𝑙𝑑𝑎𝑡𝑎,𝑠𝑒𝑛𝑑𝑒𝑟,𝑣𝑎𝑙𝑢𝑒,𝑏𝑙𝑜𝑐𝑘)
+21:for𝑡=1to5do
+22:exec𝐵 𝑟𝑡,𝐵′𝑟𝑡 under𝜉
+23:end for
+24:𝑂←OBS(𝐵 𝑟𝑡,𝜉);𝑂 ′ ←OBS(𝐵 ′𝑟𝑡,𝜉)
+25:⊳𝑂: call target/type, SSTORE slot/order, LOG topic/len,
+REVERT/INVALID, trie root
+26:if𝑂≠𝑂 ′ then
+27:𝑦←1
+28:else
+29:𝑦←0; resample or audit
+30:end if
+31:return𝐵 ′𝑟𝑡,𝑦
+independently verified by reassembly, ABI validation, and
+sampled differential execution to ensure that the externally
+observable semantics of mutated samples are opposite.
+Based on the above inheritance and extension, the spe-
+cific definitions of the five mutation types in Mut-Set are as
+follows. Systematic call hijacking CH acts only on bench-
+mark bytecode containing at least two statically locatable
+call events; if there are fewer than two statically locatable
+call events, the sample is skipped and resampled until the
+CH class reaches 200 pairs. Storage hijacking SH tampers
+with SSTORE slots or inserts unauthorized writes. Reen-
+trancy reordering RS swaps the order of data-independent
+SSTORE-CALLstatements,destroyingtheChecks-Effects-
+Interactions pattern. Parameter tampering PT changes the
+calldata offset or length incorrectly while keeping the se-
+lector unchanged. Event signature tampering ET changes
+the topic0 or data length of LOG incorrectly. The complete
+generation and validation process is shown in Algorithm 3.
+Comparison methods all run under unified preprocess-
+ing: metadata stripping, PUSH data skipping, and runtime
+bytecode extraction.
+Table 2
+Coordinate descent search results of𝛼𝜏.
+Parameter Interval Step Init. Conv.
+𝛼𝑐𝑎𝑙𝑙 [0, 2.0] 0.1 1.0 1.8
+𝛼𝑠𝑡𝑜𝑟𝑒 [0, 2.0] 0.1 1.0 0.6
+𝛼𝑙𝑜𝑔 [0, 2.0] 0.1 1.0 0.3
+𝛼𝑒𝑥𝑐 [0, 2.0] 0.1 1.0 0.5
+𝛼𝑟𝑒𝑡 [0, 2.0] 0.1 1.0 0.1
+OED: normalized opcode edit distance.
+CFG: VF2 approximate graph matching, with basic
+blocks as nodes and opcode multisets as attributes.
+NG: cosine similarity over opcode trigram frequency
+vectors. It captures local opcode co-occurrence but ignores
+long-range order and CFG topology.
+SF: grid-weighted fusion of OED, CFG, and NG on the
+mixed validation set, with weights summing to 1 and step
+size 0.05, aiming to maximize discrimination; this mixed
+validation set is completely disjoint from the training, cal-
+ibration, and test sets at the contract address level.
+E2V: structural code embedding reproduced according
+to (Gao et al., 2020), DeBERTa-v2 style, about 14M pa-
+rameters, pre-trained with MLM self-supervision on19,200
+training-set contracts, truncated to 512 tokens and encoded
+into 768-dimensional vectors.
+SmartTrans: uses the public pre-trained model (Chen
+etal.,2025b),fine-tunedwithcontrastivelearningon19,200
+training-set contracts, 50 epochs, batch size 100, using the
+paper’s contract-level aggregation. Hyperparameter search
+and tuning fairness are described below. The default config-
+uration results are finally reported.
+SITM: the method in this paper.
+Esim (Chen et al., 2025c) reports AUC 96.3%, but the
+prototype is not open-sourced and cannot be reproduced
+under the same protocol, so it is only used as a qualitative
+reference for the graph learning route.
+Hyperparameters and tuning fairness.𝛼𝜏 is searched by
+coordinate descent on 500 calibration equivalence pairs,
+withsearchinterval[0,2.0]andstepsize0.1.Ineachround,
+all other parameters are fixed and the current parameter is
+searched one by one until convergence; the objective is to
+maximize the mean score of equivalent pairs and minimize
+the variance. The final converged values are shown in Ta-
+ble2.Afterconvergence,themeanscoreofequivalentpairs
+is 0.9438 and the variance is 0.0072.𝜃ℎ𝑖,𝜃 𝑙𝑜,𝛾, the clas-
+sification threshold, and SF fusion weights are determined
+on an independent 1,000-pair mixed validation set; SF and
+SITM use the same search budget. To control asymmetry
+in tuning strength, SmartTrans performs a grid search on
+the same mixed validation set over learning rate {1e-5, 2e-
+5, 5e-5}, batch size {50, 100}, and early-stopping patience
+{10, 20}. The AUC change of the optimal configuration
+relativetothepaper’sdefaultconfigurationislessthan0.005
+(about 0.982 vs. 0.98), so the main text reports the default
+configuration results. Pre-training leakage is controlled by
+Anonymous:Preprint submitted to ElsevierPage 11 of 22
+
+--- PAGE 12 ---
+SITM
+Figure 3:Opt-Pair optimizer equivalence group score distribution and deviation comparison.
+the temporal out-of-time test subset at the end of Section
+4.4;thispaperdoesnotattributeSmartTrans’smajor-version
+decline solely to checked arithmetic, but interprets it as
+distribution mismatch risk caused by differences in source,
+optimization configuration, and corpus composition. The
+relativeadvantageofSITMisregardedasareferenceresult.
+Evaluation metrics are divided into four categories:
+1. Equivalence stability: mean, median, standard devia-
+tion, P5/P95, average deviation, and maximum devi-
+ation, where average deviation is defined as 1 minus
+the mean.
+2. Perturbation sensitivity classification: with equiva-
+lence as the positive class, report ROC-AUC, PR-
+AUC,andPrecision,Recall,F1,andFPRatthreshold
+0.6.
+3. Noiserobustness:Δ𝑆beforeandafternoiseinjection.
+4. Statisticaltests:pairedWilcoxonsigned-ranktestand
+Cliff’sdelta;95%confidenceintervalsofclassification
+metrics are obtained by 1,000 bootstrap resamples.
+4.2. Experiment 1: Compiler Optimizer
+Robustness (RQ.1)
+The Opt-Pair evaluation set contains 24,079 optimizer
+equivalence samples. All variants are generated from the
+same source, with only the optimizer switch toggled and
+runs set to 200, so the theoretical similarity should be 1.0.
+Figure 3(a) reports global statistics of each method on Opt-
+Pair:eachmethodcorrespondstoaP5–P95verticallinewith
+endpoint quantile labels, a median horizontal line, and a
+meanpoint;Figure3(b)splitsdeviationintotwobargroups,
+Mean_Dev and Max_Dev.
+From Figure 3(a), the distributions of traditional struc-
+tural metrics are generally low and dispersed: the means of
+OED, CFG, and NG are 0.552, 0.691, and 0.615, respec-
+tively, with P5 as low as 0.447–0.607, and the widest P5–
+P95 span exceeding 0.31, indicating that structural metrics
+bothunderestimatesimilarityandfailtostablyreproducethe
+samescoreunderoptimizerswitching.ThecalibratedSFand
+embeddingbaselineE2Vimprove,withmeansof0.687and
+0.723, but still have a clear gap from supervised methods.
+The distributions of SmartTrans and SITM are significantly
+concentratedtoward1.0:meansof0.914and0.944,medians
+of 0.936 and 0.967, and P95 both above 0.974.
+Figure 3(b) further quantifies deviation. The Mean_Dev
+of OED, CFG, and NG is between 0.31 and 0.45; SF and
+E2V are 0.313 and 0.277; SmartTrans and SITM are 0.086
+and0.056.SITM’sMean_Devisrelativelyreducedbyabout
+87.5%comparedwithOEDandabout82.1%comparedwith
+SF,performingbestamongtask-specific-training-freemeth-
+ods; compared with the supervised baseline SmartTrans,
+SITM’s Mean_Dev is relatively reduced by about 34.7%.
+Ontailsamples,SITMandSmartTranseachhavestrengths
+and weaknesses. SITM’s P5 is 0.718, higher than E2V’s
+0.612, indicating that its lower bound on the worst 5% of
+samples is better than the embedding baseline; however,
+P5 is lower than SmartTrans’s 0.746. Meanwhile, SITM’s
+Max_Devis0.555,higherthanSmartTrans’s0.376,indicat-
+ing that jump-aware pre-training and supervised fine-tuning
+still have advantages in suppressing extreme deviations.
+In other words, SITM is better in overall stability, while
+SmartTrans is more stable on extreme tail samples. They
+are complementary rather than replacements.
+Manual spot checking of samples below P5 found two
+concentratedcases.First,thetargetaddressofDELEGATE-
+CALL in proxy contracts is mostly computed dynamically
+at runtime, and after optimization the call event degener-
+ates from exact matching to wildcard matching. Second,
+in contracts that dynamically concatenate function selectors
+usingabi.encodeWithSelector, many selector fields fall into
+the[DYN_SEL]wildcard. These two types of samples sys-
+tematically lower SITM scores, while they are semantically
+equivalent to the benchmark bytecode, belonging to the
+known boundary of SITM in dynamic-field scenarios.
+Anonymous:Preprint submitted to ElsevierPage 12 of 22
+
+--- PAGE 13 ---
+SITM
+Figure 4:Ver-Pair version migration group score distribution and deviation comparison.
+The Wilcoxon signed-rank test shows that the paired
+score differences between SITM and all baselines are statis-
+tically significant, p < 0.001. Effect sizes differ noticeably:
+forOED,CFG,NG,andSF,Cliff’sdeltaisbetween0.91and
+0.98, all extremely large effects; for E2V it is 0.8756, also
+anextremelylargeeffect;forSmartTransitisonly0.1828,a
+small effect, and the actual gap between the two is limited.
+4.3. Experiment 2: Cross-Version Stability (RQ.2)
+Figure4reportsglobalstatisticsof678versionmigration
+samples.
+Figure 4(a) shows that traditional structural metrics ex-
+hibitanobviousbimodaldistributiononVer-Pair:themedi-
+ans of OED, CFG, NG, and SF are between 0.88 and 0.99,
+butP5isaslowas0.23–0.47,withminor-versionmigration
+samples close to full score, while major-version migration
+samples showing a more pronounced score decline despite
+preserving semantic equivalence; E2V’s P5 is only 0.284,
+even lower than OED. SITM has the most concentrated dis-
+tribution, with a median of 1.000, P5 of 0.691, and P5–P95
+span of 0.309. In Figure 4(b), SITM’s Mean_Dev is 0.066,
+relatively reduced by about 69.0% compared with OED and
+about55.9%comparedwithSmartTrans;Max_Devis0.537,
+lower than SmartTrans’s 0.551. Overall, SITM is no worse
+than baselines in all statistics.
+Figure5givestheaveragescoretrendofmigrationfrom
+0.5.17 as the baseline to subsequent versions. Under minor-
+version spans to 0.6.12 and 0.7.6, most methods maintain
+high scores. SITM achieves average scores of 0.997 and
+0.994,andSmartTrans,NG,andE2Varealsoabove0.9.Un-
+dermajor-versionspansto0.8.19and0.8.20,checkedarith-
+metic and more complex ABI encoding drastically change
+bytecode structure. OED and CFG fall below 0.4, SF, NG,
+and E2V fall below the 0.6 threshold, and SmartTrans falls
+inthe0.6–0.7range;SITMdecaysmoregently,maintaining
+0.837 and 0.767.
+Figure 5:Cross-version stability breakdown.
+Todistinguish“scoredoesnotcollapse”from“semantic
+equivalence judgment,” Table 3 reports SITM performance
+separately on the two subsets, as well as the proportion
+judged equivalent with score≥0.6.
+Ontheminor-versionmigrationsubset,99.2%ofthese-
+manticallyequivalentpairsarecorrectlyclassifiedasequiva-
+lent,withscoresclosetofullsimilarity.Onthemajor-version
+migrationsubset,theaverageSITMscoredecreasesto0.78,
+while 86.1% of the semantically equivalent pairs are still
+classified as equivalent at the threshold of 0.6.
+Since both subsets consist of semantically equivalent
+pairs,theloweracceptancerateonmajor-versionmigrations
+doesnotindicatefalse-positiveerrors.Instead,theremaining
+13.9% represents false negatives, where semantically equiv-
+alent bytecode pairs receive scores below the classification
+threshold.
+Anonymous:Preprint submitted to ElsevierPage 13 of 22
+
+--- PAGE 14 ---
+SITM
+Table 3
+Cross-version similarity and equivalence recognition on Ver-Pair subsets.
+Subset Pairs SITM mean Judged equivalent ratio
+Minor-version migration 520 0.99 99.2%
+Major-version migration 158 0.78 86.1%
+Table 4
+Relative order preservation rate of key events.
+Event pair Opt-Pair Ver minor Ver major
+CALL-SSTORE 98.7% 97.8% 91.3%
+SSTORE-LOG 99.2% 98.5% 93.7%
+CALL-LOG 99.0% 98.1% 92.4%
+These results demonstrate that SITM maintains strong
+similarity stability under minor-version migration and re-
+tains reasonable equivalence recognition capability under
+major-version migration. However, the larger compiler-
+versionspanintroducesgreaterstructuraldivergence,result-
+ing in reduced similarity scores and a higher false-negative
+rate.
+The core assumption of SIT is that the static relative
+orderofkeysemanticeventsisnotdisruptedbycompilation
+configurations. To test this assumption, Table 4 counts the
+relative order preservation rate of key event pairs on the
+Opt-Pair and Ver-Pair subsets, i.e., the proportion of event
+pairs within the same function whose relative positions are
+consistent in the two bytecodes.
+Under optimizer switching, the order preservation rate
+ofkeyeventpairsis98.7%–99.2%,andunderminor-version
+spans it is 97.8%–98.5%. The assumption is supported by
+large samples in these two scenarios; under major-version
+spans it decreases to 91.3%–93.7%. Separate analysis of
+order-drift samples shows that the average SITM score of
+equivalent pairs is about 0.71, while the overall value is
+0.94;thedetectionrateofRSmutationsconstructedondrift
+samples is about 38%, compared with 76% on straight-line
+code. This delimits the failure boundary of SIT.
+Thetrade-offbetweenstaticlayoutorderandCFGtopo-
+logical order can also be explained accordingly: topologi-
+cal order requires fully parsing jump targets, while about
+30% of contracts in the corpus contain dynamic jumps that
+cannotbestaticallyparsed,andtopological-orderextraction
+requiresblock-levelsymbolicanalysisoftheentirecontract.
+Given that the preservation rate of key event pairs is about
+99%, static order is consistent with execution order on the
+vast majority of samples, and its cost is about two orders
+of magnitude lower than topological-order schemes, better
+fitting the goal of batch pre-screening.
+4.4. Experiment 3: Predefined Source-Level
+Mutation Sensitivity (RQ.3)
+To verify the label reliability of Mut-Set, this paper
+randomly samples 20 pairs from each class, 100 pairs in
+total, and performs differential execution of original and
+mutatedbytecodeinaFoundryEVMsandbox:fixinginitial
+storage, calldata, msg.sender, value, and block context, re-
+playing5transactionsperpair,andcomparingexternalcalls,
+SSTORE slots and order, LOG, REVERT/INVALID, and
+Storage/Receipts Trie Root transaction by transaction. The
+validation results are shown in Table 5.
+Amongthem,allsampledCHsamplessatisfythedefini-
+tion of systematic multi-point call hijacking in Section 4.1;
+single-point call hijacking is not within the sampling scope.
+The above validation is sampled validation, and differential
+execution is not performed on all samples. Therefore, the
+negative labels of Mut-Set are based on mutation operators,
+sampleddifferentialexecution,andmanualauditing,andthe
+related results are stated as SITM’s sensitivity to predefined
+source-levelmutations,ratherthangeneraldiscriminationof
+real-world semantic mutations.
+Table 6 reports classification performance on Mut-Set:
+the set contains 1,000 predefined disassembly-layer muta-
+tion negative pairs and 1,000 equivalent positive pairs, with
+threshold 0.6. Values in parentheses are 95% confidence
+intervals from 1,000 bootstrap resamples.
+OED and NG basically lose discrimination ability, with
+ROC_AUC only 0.07 and 0.11, and FPR both 1.00. OED’s
+AUC below 0.5 indicates that its score direction is opposite
+to semantics: it gives low scores to equivalent pairs and
+high scores to mutation pairs with very small structural
+perturbations;ifOEDscoresarereversed,theAUCisabout
+0.93,whichhelpsunderstandthenatureofitsbias.CFGand
+SF perform moderately, with AUC 0.67 and 0.64, and high
+FPR. E2V has good fixed-threshold metrics, with F1 0.93
+and FPR 0.10, but ROC_AUC 0.86, lower than SmartTrans
+and SITM. SITM’s overall performance is second only to
+SmartTrans,withrecall0.96asitsmainadvantage,butFPR
+0.27meansaboutonequarterofmutationsaremisjudgedas
+equivalent, and precision is low.
+The threshold 0.6 is selected on an independent valida-
+tion set; within 0.45–0.75, SITM’s F1 fluctuates by about
+0.01,sothethresholditselfisinsensitive.Giventhehighcost
+of missed detection in security auditing, Table 7 compares
+the default operating point and the strict operating point.
+After raising the threshold to 0.8, FPR decreases from
+0.27 to 0.17 and precision increases to 0.84, at the cost of
+recall decreasing to 0.89. Based on this, this paper gives a
+tieredusageparadigm:SITMservesasanO(n)pre-filterfor
+batchpre-screening;positivesampleswithscoresinthegray
+zone [0.60, 0.85] are sent to SmartTrans, heavy symbolic
+execution, or dynamic fuzzing for secondary confirmation;
+asset-security zero-tolerance scenarios directly adopt strict
+Anonymous:Preprint submitted to ElsevierPage 14 of 22
+
+--- PAGE 15 ---
+SITM
+Table 5
+Sampled differential execution validation results of Mut-Set negative labels.
+Mutation type Sampled pairs Confirmed state divergence No divergence Undeployable Confirmation rate
+CH 20 19 1 0 95%
+SH 20 17 1 2 85%
+RS 20 19 0 1 95%
+PT 20 18 2 0 90%
+ET 20 19 1 0 95%
+Total 100 92 5 3 92%
+Note: The confirmation rate is the ratio of confirmed state-divergence samples to sampled pairs; if undeployable samples are excluded,
+the confirmation rate of executable samples is 94.8% (92/97). The 8 pairs with no divergence and undeployable samples are filled by the
+generator. Among all 1,000 negative pairs in Mut-Set, the reassembly success rate is 96.4% and the ABI consistency rate is 94.1%. Two
+authors independently spot-checked about 10% of samples and all abnormal cases, with a label agreement rate of 93% and Cohen’s𝜅=0.86.
+Table 6
+Classification metrics of predefined source-level mutation sensitivity.
+Method ROC_AUC PR_AUC Precision Recall F1 FPR
+OED 0.07 (±0.01) 0.31 (±0.01) 0.21 (±0.01) 0.27 (±0.01) 0.23 (±0.01) 1.00 (±0.00)
+CFG 0.67 (±0.02) 0.55 (±0.02) 0.73 (±0.02) 0.94 (±0.01) 0.82 (±0.02) 0.36 (±0.02)
+NG 0.11 (±0.01) 0.31 (±0.01) 0.36 (±0.01) 0.57 (±0.01) 0.44 (±0.01) 1.00 (±0.00)
+SF 0.64 (±0.02) 0.52 (±0.02) 0.68 (±0.02) 0.93 (±0.02) 0.78 (±0.03) 0.45 (±0.02)
+E2V 0.86 (±0.01) 0.79 (±0.02) 0.90 (±0.02) 0.96 (±0.01) 0.93 (±0.02) 0.10 (±0.01)
+SmartTrans 0.98 (±0.01) 0.98 (±0.01) 0.93 (±0.01) 0.98 (±0.01) 0.95 (±0.01) 0.08 (±0.01)
+SITM 0.97 (±0.02) 0.97 (±0.02) 0.78 (±0.02) 0.96 (±0.01) 0.86 (±0.02) 0.27 (±0.01)
+Table 7
+Comparison of different decision operating points.
+Operating point Thresh. Prec. Recall F1 FPR
+Default mode 0.6 0.78 0.96 0.86 0.27
+Strict mode 0.8 0.84 0.89 0.86 0.17
+mode. SITM does not assume the responsibility of final
+judgment.
+Table 8 reports the average score of each method by
+perturbation type and the layered performance of SITM.
+Traditionalstructuralmetricsgivescorescloseto1.0on
+most perturbation types, e.g., OED, NG, CFG, and SF all
+give 1.0000 on PT, completely disconnected from semantic
+equivalence; E2V scores are concentrated in 0.51–0.59;
+SmartTrans scores are all in 0.50–0.52 on the five classes,
+belowthethreshold,andarethemoststable.ForSITM,CH
+detection rate is 91% and median 0.433; remaining misses
+come from samples where the DELEGATECALL target of
+proxy contracts falls into[DYN_ADDR]; RS detection rate is
+76%, ET 78%, PT 71%, with some PT only changing length
+but not selector. SH is the weakest class, with detection rate
+only 43% and median 0.90, because when dynamic slots
+are untraceable, different slots are treated as equal by the
+[DYN_SLOT]wildcard.
+To evaluate the actual impact of dynamic-field wildcard
+matching, Table 10 groups CH and SH samples by whether
+key fields are statically traceable, and the detection rate is
+weighted by the number of samples in each group.
+CH static group detection rate is 100% and dynamic
+group 87%, with misses concentrated in the dynamic-target
+group; the penalty of soft gating on overall deviation of the
+call subsequence still keeps detection relatively high. SH
+static group is 73% and dynamic group only 11%; dynamic
+slots being “flattened” by wildcards is the core blind spot
+of SITM. On the same groups, the two embedding meth-
+ods behave differently: SmartTrans scores below 0.55 in
+all groups, and E2V above 0.90, insensitive to dynamic-
+field uncertainty; SITM scores systematically change with
+traceability, and its behavioral boundary is interpretable.
+To control SmartTrans pre-training leakage, this paper
+constructs a temporal out-of-time test subset: only contracts
+deployedafterOctober2023,withdeploymenttimeverified
+by a block explorer and not in SmartBugs or ScrawlD
+sources,150intotal,limitedinscalebypubliccorpusavail-
+ability. For each contract, one optimizer equivalence pair
+is constructed, and two types of mutations are alternately
+injected, totaling 300 negative pairs, 150 CH and 150 RS,
+forming a 450-pair test set. Table 11 reports the results.
+Onthetemporalout-of-timesubset,SITM’sAUCis0.96
+and SmartTrans’s is 0.94; the gap remains within the confi-
+denceinterval.Comparedwiththemaintestset,SmartTrans
+metrics decline somewhat while SITM remains basically
+stable, consistent with the expectation that task-specific-
+training-free methods are not constrained by pre-training
+time. This subset is small in scale and only serves as sup-
+porting evidence for pre-training leakage control, not as an
+independent basis for conclusions.
+Anonymous:Preprint submitted to ElsevierPage 15 of 22
+
+--- PAGE 16 ---
+SITM
+Table 8
+Score comparison of methods on five predefined perturbations.
+Perturbation_Type OED CFG NG SF E2V SmartTrans SITM
+CH 0.8770 0.4810 0.8340 0.5020 0.5680 0.5170 0.4530
+SH 0.9730 0.7430 0.9440 0.7830 0.5930 0.5080 0.6690
+RS 0.7540 0.5870 0.8560 0.6170 0.5120 0.5020 0.4540
+PT 1.0000 1.0000 1.0000 1.0000 0.5870 0.5080 0.5700
+ET 0.8840 0.4470 0.8690 0.5270 0.5910 0.5090 0.5470
+Table 9
+SITM detailed layered performance; Detect_Rate is the pro-
+portion of samples in this class with score below 0.6.
+Perturbation_Type SITM_Median Detect_Rate
+CH 0.433 91%
+SH 0.900 43%
+RS 0.303 76%
+PT 0.433 71%
+ET 0.385 78%
+TodelimittheapplicableboundaryofSITM,weaddthe
+following three analyses:
+1. Upper bound of soft gating: for extreme mutations
+deleting all CALL events, 30 sampled pairs have an
+average score of 0.42 and all are below the threshold,
+with a detection rate of 100%; when the trace is
+extremelylongandthecallproportionislessthan5%,
+the marginal effect of gating weakens.
+2. Loops and branches: for 20 RS mutations with while
+loops or nested if-else, the detection rate drops to
+50%,i.e.,10/20,lowerthan76%onstraight-linecode.
+N=20 is only a qualitative trend; SIT is accordingly
+limited to loop-free and shallow-branch paths.
+3. Pure computation contracts: the optimizer equiva-
+lence pairs of 50 contracts without CALL have an av-
+eragescoreof0.942,andanemptycalllayerdoesnot
+causeapenalty,butinternallogicmutationsremainin
+the blind spot.
+4.5. Experiment 4: Noise Robustness (RQ.4)
+Table 12 reports score changes of each method under
+three types of noise. Noise is injected before preprocessing,
+all methods pass through the same preprocessing pipeline,
+andΔ𝑆is the average decrease after noise relative to the
+noiseless baseline.
+Combined noise is injected in a fixed order: first append
+non-standard metadata, then insert junk instructions, then
+insert invalid PUSH dead code, each type injected once
+without repetition. SITM’s score decrease under each noise
+type is smaller than baselines, with a combinedΔ𝑆of only
+0.018,lowerthanE2V’s0.064andSmartTrans’s0.072.The
+reason is that events extract only semantic key instructions;
+junk instructions and invalid PUSH do not contain opcodes
+such as CALL/SSTORE/LOG and do not generate events.
+This result evaluates robustness after unified preprocessing;
+preprocessingalreadyfilterspartofthenoise,soend-to-end
+robustness will be slightly lower, but SITM and baselines
+are compared under the same protocol, and the conclusion
+is unaffected.
+4.6. Experiment 5: Downstream Task—LLM
+Decompilation Quality Assessment (RQ.5)
+Decompilation quality assessment is the most direct
+downstream scenario of SITM. Given on-chain bytecode
+𝐵𝑜𝑟𝑖𝑔𝑖𝑛, a decompilation tool outputs Solidity source code
+𝑆𝑔𝑒𝑛, which is recompiled to obtain𝐵𝑔𝑒𝑛; if𝑆𝑔𝑒𝑛 faithfully
+restoresexecutionsemantics,thetwoshouldhavehighoper-
+ationalsemanticsimilarityunderSITM;otherwise,semantic
+drift exists. The pragma declaration output by an LLM may
+differ from the original version, requiring the metric to
+remain stable in cross-version scenarios.
+Thispaperselects6LLMs,coveringclosed-sourcefron-
+tier models Claude Opus 4.7 (Anthropic, 2026), GPT-5.4
+(OpenAI, 2026), open-weight models Qwen3 (Yang, Li,
+Yang, Zhang, Hui, Zheng, Qiu et al., 2025), GLM-5 (Zeng,
+Lv, Hou, Du, Zheng, Chen and Zhou, 2026), the code-
+specific model CodeLlama-7b (Roziere, Gehring, Gloeckle,
+Sootla, Gat, Tan and Synnaeve, 2023), and the small-scale
+general model Llama 3.2 (Meta Platforms, 2024). They are
+complementary in openness, reasoning ability, parameter
+scale, code specificity, and training cutoff time; the model
+selection goal is to cover different decompilation quality
+levels. SITM evaluates output semantic consistency rather
+than model generation ability.
+We stratify 120 contracts by business type, including
+40 ERC20, 30 ERC721, 25 lending and DeFi, and 25 auc-
+tion/voting/other. Each LLM independently decompiles all
+contracts, and compilation-failure samples are not included
+inpairing;thecompilationfailureratesofLLMsareClaude
+5.0%, GPT 5.8%, Qwen 10.0%, GLM 11.7%, CodeLlama
+20.0%,andLlama24.2%.Failuresamplesaresystematically
+biased toward small models, i.e., more failure cases are
+removedforsmallmodels,andthesuccessful-samplesubset
+actually overestimates their performance. The direction of
+selection bias is unfavorable to this paper’s conclusion that
+“strong and weak are separable,” and is a conservative bias.
+To satisfy the balanced design requirement of statistical
+testing, the main analysis takes 52 contracts successfully
+compiled by all 6 LLMs, totaling 312 pairs; all successful
+samples of each LLM total 628 pairs, used for average
+Anonymous:Preprint submitted to ElsevierPage 16 of 22
+
+--- PAGE 17 ---
+SITM
+Table 10
+Impact of dynamic-field wildcard matching on CH and SH detection performance.
+Perturbation type Group Sample pairs Detection rate Average score
+CH Statically traceable target 62 100% 0.189
+CH Dynamic target 138 87% 0.572
+CH Overall weighted 200 91% -
+SH Statically traceable base slot 102 73% 0.482
+SH Dynamic slot 98 11% 0.864
+SH Overall weighted 200 43% -
+Table 11
+Temporal out-of-time test subset results, N=150 contracts,
+numerical error range±0.03.
+Method ROC_AUC Opt mean
+OED 0.08 0.54
+CFG 0.66 0.68
+E2V 0.84 0.71
+SmartTrans 0.94 0.87
+SITM 0.96 0.93
+Figure 6:Average scores of 6 LLMs on 7 similarity metrics.
+scoredisplay.Bytecodeonbothsidesisuniformlymetadata-
+stripped.
+As shown in Figure 6, all metrics are consistent in LLM
+ranking: the top two are GPT-5.4 and Claude Opus 4.7, and
+the bottom two are CodeLlama-7b and Llama 3.2. The de-
+compilationqualityrankingisnotaffectedbymetricchoice.
+In absolute scores, structural metrics, i.e., OED, CFG, and
+NG, systematically underestimate decompilation outputs,
+whileSITM,E2V,andSmartTransareclosertotheintuition
+that“mostdecompilationisbasicallysuccessful”;theSITM
+scoregapbetweenstrongandweakLLMsislargerthanthat
+of embedding methods, making it more sensitive to subtle
+quality differences. On weak models, SITM is close to or
+slightlylowerthanSmartTrans,reflectingthatSITMismore
+sensitive to semantic drift and stricter about decompilation
+failure;thelargerscoregapbetweenstrongandweakmodels
+indicates that SITM has higher discrimination of quality
+levels.
+Statistical tests are performed on the balanced set: the
+Friedman test with N=52, k=6 gives𝜒2(5) = 86.7, p <
+0.001. The average ranks of LLMs under the SITM metric
+are Claude 1.9, GPT 2.1, Qwen 3.4, GLM 3.8, CodeLlama
+4.9, and Llama 4.9. The Nemenyi post-hoc test at𝛼=0.05,
+k=6, N=52 gives a critical difference CD = 1.05: the rank
+difference between Claude/GPT and CodeLlama/Llama is
+about3.0,exceedingCD,sothedifferenceissignificant;the
+differencebetweenQwen/GLMandthetwosmallmodelsis
+about 1.5, also significant; the differences between Claude
+andGPTandbetweenCodeLlamaandLlamaarenotsignif-
+icant.
+In summary, SITM can reasonably distinguish the de-
+compilation quality of different LLMs: the ranking is con-
+sistent with structural metrics, absolute scores are system-
+atically higher than structural metrics, and discrimination
+between strong and weak models is higher than embed-
+ding methods. Friedman and Nemenyi tests confirm that
+the main differences are significant. Combined with the ad-
+vantages of task-specific-training-free operation, white-box
+interpretability, and low cost, SITM provides a lightweight,
+reproducible,andsemanticallysensitivesolutionfordecom-
+pilation quality assessment. The 52-contract balanced set
+is limited in scale; expanding samples and incorporating
+compilation failures into unified scoring are future work.
+The LLM versions and access times used in this paper are
+provided in the supplementary material.
+4.7. Experiment 6: Ablation Study (RQ.6)
+w/o_interleave: Opt_Mean_Dev rises from 0.0562 to
+0.1079 and ROC_AUC drops to 0.9040; Ver_Mean_Dev
+onlyslightlyrises,becauseversionmigrationmainlychanges
+opcodes rather than event interleaving. More importantly,
+RS_Detect drops from 76% to 39%, representing a sub-
+stantial 37-percentage-point reduction. The three-layer in-
+dependent sequence discards the explicit relative order of
+CALL and SSTORE, weakening its ability to capture cross-
+layer reentrancy reordering. This result demonstrates the
+important contribution of the interleaved trace to RS detec-
+tion, although other event-level features still retain partial
+detection capability.
+w/o_soft_gating:theMean_DevofOptandVerinstead
+decreases to 0.0345 and 0.0456, and ROC_AUC rises to
+0.9860, but CH_Detect drops from 91% to 52%. The im-
+provementinequivalence-pairmetricsshowsthatsoftgating
+imposes additional suppression on some equivalent pairs,
+Anonymous:Preprint submitted to ElsevierPage 17 of 22
+
+--- PAGE 18 ---
+SITM
+Table 12
+Noise robustness, N=500,Δ𝑆is the mean.
+Noise type OEDΔ𝑆CFGΔ𝑆NGΔ𝑆SFΔ𝑆E2VΔ𝑆SmartTransΔ𝑆SITMΔ𝑆
+Non-standard metadata attachment 0.082 0.031 0.045 0.038 0.022 0.024 0.003
+Junk instruction insertion 0.051 0.068 0.072 0.055 0.038 0.045 0.012
+Invalid PUSH dead code 0.044 0.052 0.061 0.048 0.031 0.038 0.008
+Combined (three stacked) 0.121 0.108 0.115 0.092 0.064 0.072 0.018
+Table 13
+Ablation study.
+Config Opt_Mean_Dev Ver_Mean_Dev ROC_AUC CH_Detect RS_Detect
+SITM_Full 0.0562 0.0660 0.9715 91% 76%
+w/o_interleave(3layer) 0.1079 0.0678 0.9040 91% 39%
+w/o_soft_gating 0.0345 0.0456 0.9860 52% 76%
+w/o_type_weight 0.1486 0.1687 0.9310 91% 76%
+w/o_fine_fields 0.0381 0.0496 0.6753 69% 76%
+i.e., samples whose call subsequence slightly deviates due
+to traceability changes. This reflects its trade-off: disabling
+soft gating improves equivalence-pair stability and overall
+ROC_AUC, but reduces CH detection by 39 percentage
+points. Therefore, soft gating provides an important addi-
+tional discrimination capability for systematic multi-point
+callhijacking,whiletheunderlyingtraceandfield-matching
+mechanisms still retain partial detection capability without
+it.
+w/o_type_weight: Opt and Ver Mean_Dev rise signifi-
+cantly to 0.1486 and 0.1687, ROC_AUC slightly decreases,
+andCHandRSdetectionremainunchanged,indicatingthat
+type weighting mainly ensures equivalence-pair stability,
+while detection ability is driven by field matching and in-
+terleaved structure.
+w/o_fine_fields:ROC_AUCdropsfrom0.9715to0.6753,
+and CH_Detect drops to 69%, while RS_Detect remains
+unchanged, indicating that fine-grained fields significantly
+affect overall discrimination and call hijacking detection,
+while RS depends only on interleaving order.
+Insummary,thestaticinterleavedtraceisacorecompo-
+nent for reentrancy reordering detection, soft gating is a key
+enhancement for systematic call hijacking detection, type
+weighting ensures scoring stability, and fine-grained fields
+significantly improve overall discrimination. The ablation
+results demonstrate that these components provide com-
+plementary contributions rather than serving as mutually
+exclusive sources of detection capability. The components
+arecomplementary.Thedefaultconfigurationisanarchitec-
+tural compromise for recall-prioritized batch pre-screening,
+rather than the overall AUC optimum, and does not assume
+the responsibility of final security audit judgment. If only
+similarity retrieval is pursued, soft gating can be disabled,
+with AUC about 0.99; for pre-screening, the full version is
+used and edge samples are rechecked.
+Hyperparameter sensitivity is shown in Figure 7. In
+Figure 7(a), the classification threshold in the range 0.45–
+0.75makesF1fluctuateslightlybetween0.88and0.89,and
+FPR remains stable at 0.24–0.25; this figure is based on the
+mixedvalidationset,whereF1atthreshold0.6isabout0.89,
+slightly higher than the test-set F1 of 0.86 in Table 6, due
+to data splitting. In Figure 7(b),𝛼𝑠𝑡𝑜𝑟𝑒 in [0.4, 0.8] makes
+AUC first rise and then fall, peaking at 0.60, with an overall
+spread of only 0.0035; in Figure 7(c),𝜃ℎ𝑖 in [0.65, 0.75] has
+an AUC spread of 0.0020; in Figure 7(d),𝛾in [0.25, 0.45]
+keeps CH detection rate at about 91%. SITM is insensitive
+to hyperparameter choice.
+An interpretability case takes a pair of edge CH muta-
+tions as an example: contract A is a normal ERC20, and
+contract B only changes the target of onetransferFrom
+call frommsg.senderto an attacker address, while all other
+events remain unchanged. The alignment result shows that
+all events except this call event match exactly, with layer-
+wise𝑆 𝑐𝑎𝑙𝑙 = 0.75,𝑆 𝑠𝑡𝑜𝑟𝑒 =𝑆 𝑙𝑜𝑔 =𝑆 𝑒𝑥𝑐 = 1.0, and
+𝑆𝑡𝑟𝑎𝑐𝑒 = 0.82. Soft gating takes g = 0 because𝑆𝑐𝑎𝑙𝑙 > 𝜃ℎ𝑖,
+andfinally𝑆 𝑆𝐼𝑇𝑀 =0.82,abovethethreshold,constituting
+a missed detection.
+This case does not belong to the 200 CH mutations
+in Table 6: CH in Mut-Set usually systematically redirects
+multiple call events, making𝑆𝑐𝑎𝑙𝑙 significantly lower than
+0.70andtriggeringsoftgating,withanaverageCHdetection
+rate of 91%; this example changes only a single call event,
+and𝑆 𝑐𝑎𝑙𝑙 remains above the threshold, so soft gating is
+not triggered. This shows that SITM has a blind spot for
+single-pointcallhijacking.Suchsamplesmustberechecked
+by symbolic execution or dynamic differential analysis and
+cannot be judged by SITM alone.
+5. Discussion
+5.1. Method Advantages
+Compiler-configuration robustness:features are ex-
+tracted from the operational semantic layer, significantly
+outperforming structural metrics under optimizer switching
+and major-version spans, and having respective advantages
+Anonymous:Preprint submitted to ElsevierPage 18 of 22
+
+--- PAGE 19 ---
+SITM
+Figure 7:Hyperparameter sensitivity analysis.
+with structural metrics and training-based methods under
+minor-version spans.
+Model-training-free and low cost:trace extraction is
+linear scanning, and weighted edit distance acts on a con-
+densedshortsequence,withoverallcostofthesameorderas
+traditionaleditdistance;SmartTransrequiresGPUinference
+and jump-aware pre-training, and the paper reports a four-
+A100 training environment; Esim reports about 26 seconds
+for single-contract SSG construction. SITM takes 78.3 ms
+per pair without GPU, significantly lower cost.
+Cross-layer layout order preservation:the static inter-
+leaved trace preserves the relative position of CALL and
+SSTORE, with RS detection rate 76%. This design is more
+directthanattentionweights,whicharegloballynormalized
+and weaken exact adjacency, in explicitly preserving cross-
+layer adjacency. This judgment is indirectly supported by
+the w/o_interleave ablation, where RS_Detect drops from
+76% to 39%, demonstrating the substantial contribution of
+preserving cross-layer event order, although some detection
+capabilityremainswithoutexplicitinterleaving.Thisdesign
+has not yet been directly compared with Transformer atten-
+tion.
+Metric symmetry and interpretability:edit-distance
+costsarelimitedtogloballyfixedweights,satisfying𝑆(𝐴,𝐵)=
+𝑆(𝐵,𝐴);inadditiontotheformulaidentity,1,000randomly
+selected pairs are recomputed with swapped order, and
+scores are identical pair by pair. The alignment matrix can
+precisely trace the source of differences, e.g., a call event
+targetaddressmismatch;SmartTransembeddingsareblack-
+box and cannot localize.
+Out-of-distributionrobustnessandzeroinputdepen-
+dency:under major-version spans, SITM scores are 0.77–
+0.84, higher than SmartTrans’s 0.65–0.68. The computation
+rule is consistent across all versions and does not drift
+with training data distribution; more than 99% of on-chain
+contractsdonotdisclosesourcecode(Chenetal.,2019),and
+source and structural embedding methods (Gao et al., 2020;
+Liu et al., 2025) have insufficient coverage. SITM directly
+operates on bytecode without GPU, training data, or pre-
+trained models, lowering deployment barriers.
+5.2. Inherent Limitations
+Static order is not equivalent to dynamic execu-
+tion order:in the presence of loop bodies and conditional
+branches, static layout order and runtime order may be
+inconsistent, and reentrancy detection is distorted. Precise
+Anonymous:Preprint submitted to ElsevierPage 19 of 22
+
+--- PAGE 20 ---
+SITM
+orderrequiresCFGtopologicalorderorsymbolicexecution,
+with significantly increased cost.
+Approximate metric rather than strict proof:SITM
+is a semantic approximate metric and does not constitute a
+formal equivalence proof.
+Blindspotforpureinternalcomputationmutations:when
+mutations only involve internal mathematical operations
+withoutchangingexternalcalls,baseslots,eventsignatures,
+and exception patterns, they are still missed.
+Boundary of dynamic slot representation:although
+base-slot extraction and access-mode labels are introduced,
+completely dynamic mapping-key differences are still ab-
+stracted, and the SH dynamic-slot group detection rate is
+only 11%.
+Reducedequivalencerecognitionundermajor-version
+compiler migrations: In the major-version migration sub-
+set, 86.1% of bytecode pairs are still classified as equivalent
+at the threshold of 0.6, while the remaining 13.9% are clas-
+sified as non-equivalent, constituting false negatives under
+the semantic-equivalence assumption of this experiment.
+Although the average similarity score decreases to 0.78,
+most pairs remain above the equivalence threshold. This
+indicates that major-version compiler migrations introduce
+greater challenges to similarity consistency, resulting in
+a higher false-negative rate compared with minor-version
+migrations.
+Blind spot for single-point call hijacking:when a con-
+tractcontainsmultiplecalleventsandonlyonetargetaddress
+or selector is tampered with while other events remain
+unchanged,𝑆 𝑐𝑎𝑙𝑙 remains above the soft-gating threshold
+and the penalty is not triggered. SITM cannot detect it,
+and symbolic execution or dynamic differential analysis is
+required for secondary rechecking.
+Training-based methods still have upper-bound ad-
+vantages when labels are sufficient:SmartTrans has an
+overall AUC of 0.98, better than SITM’s 0.97. When la-
+bels are sufficient and maximum discrimination is pursued,
+SmartTrans can be used; SITM is more suitable for large-
+scale batch evaluation and unseen compilation configura-
+tions.
+5.3. Application Scenarios
+The application of SITM is limited to the pre-screening
+stage of contracts dominated by statically traceable events,
+and high-risk hit samples are then rechecked by high-
+precision models or humans: decompilation quality assess-
+ment,asaunifiedsemanticbenchmarkforfaircomparisonof
+different methods; contract homology detection, identifying
+logicalhomologyacrosscompilationversions;vulnerability
+fingerprint matching, performing secondary fine-grained
+investigation after hitting based on operational semantic
+features; on-chain contract clustering, classifying closed-
+source contracts by business semantics.
+6. Conclusion
+This paper proposes the SITM framework to address
+the lack of semantic metrics in the field of smart contract
+decompilation. Unlike separating semantic layers into in-
+dependent sequences, SITM constructs a static interleaved
+trace interleaved according to the static layout order of
+bytecode, guarantees symmetry through type-weighted edit
+distance with globally fixed calibration weights, and natu-
+rallyhandleslayerexistencethroughtraceconstruction;soft
+gating constitutes a bounded nonlinear penalty based on the
+criticality of cross-contract interactions.
+Four controlled experiments, one downstream task vali-
+dation, and one ablation analysis show that under optimizer
+perturbation,SITM’saveragedeviationisrelativelyreduced
+by about 87.5% compared with OED, ROC-AUC reaches
+0.97, and the detection rate of reentrancy-type mutations
+increases from 39% for the three-layer independent scheme
+to 76%, demonstrating the substantial contribution of cross-
+layer event interleaving to reentrancy detection. Compared
+withSmartTransfine-tunedon19,200contracts,SITMdoes
+notcomprehensivelysurpassit—SmartTransisslightlybet-
+ter in overall AUC, i.e., 0.98 vs. 0.97, and in tail stability
+underoptimizerperturbation,whileSITMiscomplementary
+in large-version score retention, about 0.80 vs. 0.67, noise
+robustness, and computational cost, and maintains white-
+boxinterpretabilityandsymmetry.Disablingsoftgatingcan
+increase AUC to about 0.99 but reduces systematic call hi-
+jackingdetectionfrom91%to52%,showingthatthedefault
+configuration is a recall-prioritized compromise that trades
+a small amount of AUC and equivalence-pair stability for a
+substantial improvement in detecting systematic redirection
+of multiple call events.
+Overall, SITM is suitable for large-scale batch pre-
+screening of contracts dominated by statically traceable
+events. It is not suitable for internal computation mutation
+detection, contracts dominated by dynamic addresses and
+dynamic slots, single-point call hijacking, or precise reen-
+trancy judgment under deep loop branches. In particular,
+it is not suitable as the final judgment or sole defense
+line in security-critical scenarios. Future work will explore:
+introducing CFG topological order to approximate dynamic
+execution order; introducing data-flow-sensitive base-slot
+propagation to reduce the storage hijacking blind spot; con-
+structing a semantic mutation test set for pure computation
+contracts; and building a hybrid architecture with SITM
+as fast pre-screening and GNN embeddings for precise
+judgment of edge samples.
+Reproducibility Statement
+The experimental code, mutation generator, calibration
+and test splits, and pre-trained E2V model weights in this
+paper will be publicly released in an anonymous GitHub
+repository after paper acceptance, including one-click re-
+production scripts. The compilation environment, random
+seeds,hyperparametersearchspace,andprotocolhavebeen
+fully described in Section 4.1. SmartBugs 2.0 is a public
+dataset, and the compilation scripts and filtering criteria are
+provided in the supplementary material.
+Anonymous:Preprint submitted to ElsevierPage 20 of 22
+
+--- PAGE 21 ---
+SITM
+References
+Albert, E., Gordillo, P., Livshits, B., Rubio, A., Sergey, I., 2018. Ethir: A
+framework for high-level analysis of ethereum bytecode, in: Proc. Int.
+Symp. Automated Technology for Verification and Analysis, pp. 513–
+520.
+Anthropic, 2026. Claude Opus 4.7 system card. Technical Report.
+Anthropic. URL:https://www.anthropic.com/news/claude-opus-4-7.
+Bao, T., Burket, J., Woo, M., Turner, R., Brumley, D., 2014. Byteweight:
+Learning to recognize functions in binary code, in: Proc. 23rd USENIX
+Security Symp., pp. 845–860.
+Barboni, M., Morichetta, A., Polini, A., 2022. Sumo: A mutation testing
+approach and tool for the ethereum blockchain. Journal of Systems and
+Software 193, 111445.
+Brent, L., Jurisevic, A., Kong, M., Liu, E., Gauthier, F., Gramoli, V., Holz,
+R., Scholz, B., 2018. Vandal: A scalable security analysis framework
+for smart contracts. arXiv preprint arXiv:1809.03981. URL:https:
+//arxiv.org/abs/1809.03981.
+Brumley,D.,Lee,J.,Schwartz,E.J.,Woo,M.,2013. Nativex86decompila-
+tionusingsemantics-preservingstructuralanalysisanditerativecontrol-
+flow structuring, in: Proc. 22nd USENIX Security Symp., pp. 353–368.
+Cao, Y., Liang, R., Chen, K., Hu, P., 2022. Boosting neural networks to
+decompile optimized binaries, in: Proc. 38th Annu. Comput. Security
+Appl. Conf., pp. 508–518.
+Chen, E., Tang, X., Xiao, Z., Li, C., Li, S., Wu, T., Chalkias, K.K.,
+2025a. Suigpt mad: Move ai decompiler to improve transparency and
+auditability on non-open-source blockchain smart contract, in: Proc.
+ACM Web Conf., pp. 1567–1576.
+Chen, L., Wang, H., Zhou, Y., Wong, T., Wang, J., Zhang, C., 2025b.
+Smarttrans:Advancedsimilarityanalysisfordetectingvulnerabilitiesin
+ethereumsmartcontracts. IEEETransactionsonDependableandSecure
+Computing 22, 4412–4427.
+Chen,Q.,Lacomis,J.,Schwartz,E.J.,LeGoues,C.,Neubig,G.,Vasilescu,
+B., 2022. Augmenting decompiler output with learned variable names
+and types, in: Proc. 31st USENIX Security Symp., pp. 4327–4343.
+Chen, T., Li, Z., Luo, X., Wang, X., Wang, T., He, Z., Zhang, X., 2021a.
+Sigrec: Automatic recovery of function signatures in smart contracts.
+IEEE Transactions on Software Engineering 48, 3066–3086.
+Chen, T., Zhang, Y., Li, Z., Luo, X., Wang, T., Cao, R., Zhang, X.,
+2019. Tokenscope: Automatically detecting inconsistent behaviors of
+cryptocurrencytokensinethereum,in:Proc.2019ACMSIGSACConf.
+Comput. Commun. Secur., pp. 1503–1520.
+Chen,X.,Liao,P.,Zhang,Y.,Huang,Y.,Zheng,Z.,2021b. Understanding
+code reuse in smart contracts, in: Proc. IEEE Int. Conf. Softw. Anal.,
+Evol. and Reengineering (SANER), pp. 470–479.
+Chen, Z., Ji, G., He, Y., Wu, L., Zhou, Y., 2025c. Esim: Evm bytecode
+similarity detection based on stable-semantic graph. arXiv preprint
+arXiv:2511.12971. URL:https://arxiv.org/abs/2511.12971.
+Cifuentes, C., Gough, K.J., 1995. Decompilation of binary programs.
+Software: Practice and Experience 25, 811–829.
+ConsenSys,2017. Mythril. URL:https://github.com/ConsenSysDiligence/
+mythril.
+Contro, F., Crosara, M., Ceccato, M., Dalla Preda, M., 2021. Ethersolve:
+Computing an accurate control-flow graph from ethereum bytecode, in:
+Proc. 29th IEEE/ACM Int. Conf. Program Comprehension (ICPC), pp.
+127–137.
+David, I., Zhou, L., Song, D., Gervais, A., Qin, K., 2025. Decom-
+piling smart contracts with a large language model. arXiv preprint
+arXiv:2506.19624. URL:https://arxiv.org/abs/2506.19624.
+Di Angelo, M., Durieux, T., Ferreira, J.F., Salzer, G., 2023. Smartbugs
+2.0: An execution framework for weakness detection in ethereum smart
+contracts, in: Proc. 38th IEEE/ACM Int. Conf. Automated Softw. Eng.
+(ASE), pp. 2102–2105.
+Fu,C.,Chen,H.,Liu,H.,Chen,X.,Tian,Y.,Koushanfar,F.,Zhao,J.,2019.
+Coda: An end-to-end neural program decompiler, in: Proc. Adv. Neural
+Inf. Process. Syst.
+Gao, Z., Jiang, L., Xia, X., Lo, D., Grundy, J., 2020. Checking smart con-
+tracts with structural code embedding. IEEE Transactions on Software
+Engineering 47, 2874–2891.
+Grech, N., Brent, L., Scholz, B., Smaragdakis, Y., 2019. Gigahorse:
+Thorough, declarative decompilation of smart contracts, in: Proc. 41st
+IEEE/ACM Int. Conf. Softw. Eng. (ICSE), pp. 1176–1186.
+Grech, N., Lagouvardos, S., Tsatiris, I., Smaragdakis, Y., 2022. Elipmoc:
+Advanced decompilation of ethereum smart contracts. Proc. ACM
+Program. Lang. 6, 1–27.
+Hartel, P., Schumi, R., 2020. Mutation testing of smart contracts at scale,
+in: International Conference on Tests and Proofs, pp. 23–42.
+He,J.,Li,S.,Wang,X.,Cheung,S.C.,Zhao,G.,Yang,J.,2023.Neural-febi:
+Accurate function identification in ethereum virtual machine bytecode.
+Journal of Systems and Software 199, 111627.
+He, N., Wu, L., Wang, H., Guo, Y., Jiang, X., 2020. Characterizing code
+clones in the ethereum smart contract ecosystem, in: Proc. Int. Conf.
+Financial Cryptography and Data Security, pp. 654–675.
+Iuliano, G., Corradini, D., Pasqua, M., Ceccato, M., Di Nucci, D., 2025.
+How do solidity versions affect vulnerability detection tools? an empir-
+ical study. arXiv preprint arXiv:2504.05515. URL:https://arxiv.org/
+abs/2504.05515.
+Katz, D.S., Ruchti, J., Schulte, E., 2018. Using recurrent neural networks
+fordecompilation,in:Proc.IEEE25thInt.Conf.Softw.Anal.,Evol.and
+Reengineering (SANER), pp. 346–356.
+Kondo, M., Oliva, G.A., Jiang, Z.M., Hassan, A.E., Mizuno, O., 2020.
+Codecloninginsmartcontracts:Acasestudyonverifiedcontractsfrom
+the ethereum blockchain platform. Empirical Software Engineering 25,
+4617–4675.
+Lagouvardos, S., Grech, N., Tsatiris, I., Smaragdakis, Y., 2020. Precise
+static modeling of ethereum ‘memory’. Proc. ACM Program. Lang. 4,
+1–26.
+Li,Y.,Song,W.,Huang,J.,2024. Varlifter:Recoveringvariablesandtypes
+from bytecode of solidity smart contracts. Proc. ACM Program. Lang.
+8, 1–29.
+Liao, Z., Nan, Y., Gao, Z., Liang, H., Hao, S., Ren, P., Zheng, Z., 2025.
+Augmenting smart contract decompiler output through fine-grained
+dependencyanalysisandllm-facilitatedsemanticrecovery. IEEETrans-
+actions on Software Engineering .
+Lin, Y., Gao, D., Lo, D., 2022. Resil: Revivifying function signature
+inferenceusingdeeplearningwithdomain-specificknowledge,in:Proc.
+12th ACM Conf. Data and Appl. Security and Privacy, pp. 107–118.
+Liu,H.,Yang,Z.,Liu,C.,Jiang,Y.,Zhao,W.,Sun,J.,2018. Eclone:Detect
+semantic clones in ethereum via symbolic transaction sketch, in: Proc.
+26th ACM Joint Eur. Softw. Eng. Conf. Symp. Found. Softw. Eng., pp.
+900–903.
+Liu, Z., Ma, L., Mu, Z., Wei, C., Xu, X., Jiao, Y., Ren, K., 2025. I know
+who clones your code: Interpretable smart contract similarity detection.
+IEEE Transactions on Dependable andSecure Computing Early access.
+Luu, L., Chu, D.H., Olickel, H., Saxena, P., Hobor, A., 2016. Making
+smart contracts smarter, in: Proc. 2016 ACM SIGSAC Conf. Comput.
+Commun. Secur., pp. 254–269.
+MetaPlatforms,I.,2024. Llama3.23binstructmodelcard. MetaAI. URL:
+https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct.
+OpenAI, 2026. Introducing gpt-5.4. OpenAI Blog. URL:https://openai.
+com/index/introducing-gpt-5-4/.
+Pei, K., Guan, J., Broughton, M., Chen, Z., Yao, S., Williams-King, D.,
+Jana, S., 2021. Stateformer: Fine-grained type recovery from binaries
+using generative state modeling, in: Proc. 29th ACM Joint Eur. Softw.
+Eng. Conf. Symp. Found. Softw. Eng. (ESEC/FSE), pp. 690–702.
+Ragkhitwetsagul, C., Krinke, J., Clark, D., 2018. A comparison of code
+similarity analysers. Empirical Software Engineering 23, 2464–2519.
+Roy,C.K.,Cordy,J.R.,2007.Asurveyonsoftwareclonedetectionresearch.
+Technical Report 541(115). Queen’s School of Computing.
+Roziere, B., Gehring, J., Gloeckle, F., Sootla, S., Gat, I., Tan, X.E., Syn-
+naeve, G., 2023. Code llama: Open foundation models for code. arXiv
+preprint arXiv:2308.12950. URL:https://arxiv.org/abs/2308.12950.
+Su,X.,Liang,H.,Wu,H.,Niu,B.,Xu,F.,Zhong,S.,2025. Disco:Towards
+decompilingevmbytecodetosourcecodeusinglargelanguagemodels.
+Proc. ACM Softw. Eng. 2, 2311–2334.
+Sun,K.,Xu,Z.,Liu,C.,Li,K.,Liu,Y.,2023.Demystifyingthecomposition
+andcodereuseinsoliditysmartcontracts,in:Proc.31stACMJointEur.
+Anonymous:Preprint submitted to ElsevierPage 21 of 22
+
+--- PAGE 22 ---
+SITM
+Softw. Eng. Conf. Symp. Found. Softw. Eng., pp. 796–807.
+Sun, Y., Bao, L., Yang, X., 2025. Fire: Smart contract bytecode function
+identification via graph-refined hybrid feature encoding, in: Proc. 16th
+Int. Conf. Internetware, pp. 378–388.
+Tan, H., Luo, Q., Li, J., Zhang, Y., 2024. Llm4decompile: Decompiling
+binary code with large language models, in: Proc. 2024 Conf. Empir.
+Methods Nat. Lang. Process., pp. 3473–3487.
+Wang, Z., Wan, Z., Chen, Y., Zhang, Y., Lo, D., Xie, D., Yang, X., 2025.
+Clonedetectionforsmartcontracts:Howfararewe? Proc.ACMSoftw.
+Eng. 2, 1249–1269.
+Yakdan,K.,Eschweiler,S.,Gerhards-Padilla,E.,Smith,M.,2015. Nomore
+gotos: Decompilation using pattern-independent control-flow structur-
+ing and semantic-preserving transformations, in: Proc. NDSS.
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B., Qiu, Z., et al.,
+2025. Qwen3 technical report. arXiv:2505.09388.
+Yashavant, C.S., Kumar, S., Karkare, A., 2022. Scrawld: A dataset of
+realworldethereumsmartcontractslabelledwithvulnerabilities. arXiv
+preprint arXiv:2202.11409. URL:https://arxiv.org/abs/2202.11409.
+Zakeri-Nasrabadi, M., Parsa, S., Ramezani, M., Roy, C., Ekhtiarzadeh, M.,
+2023. A systematic literature review on source code similarity mea-
+surementandclonedetection:Techniques,applications,andchallenges.
+Journal of Systems and Software 204, 111796.
+Zeng, A., Lv, X., Hou, Z., Du, Z., Zheng, Q., Chen, B., Zhou, Y., 2026.
+Glm-5: From vibe coding to agentic engineering. arXiv:2602.15763.
+Zhao,K.,Li,Z.,Li,J.,Ye,H.,Luo,X.,Chen,T.,2023.Deepinfer:Deeptype
+inference from smart contract bytecode, in: Proc. 31st ACM Joint Eur.
+Softw.Eng.Conf.Symp.Found.Softw.Eng.(ESEC/FSE),pp.745–757.
+Zhu, D., Yue, F., Pang, J., Zhou, X., Han, W., Liu, F., 2022. Bytecode
+similarity detection of smart contract across optimization options and
+compiler versions based on triplet network. Electronics 11, 597.
+Anonymous:Preprint submitted to ElsevierPage 22 of 22

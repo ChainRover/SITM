@@ -1,0 +1,7 @@
+group,event_pair,n,preserved
+opt,CALL-SSTORE,1,1.0
+opt,SSTORE-LOG,1,1.0
+opt,CALL-LOG,1,1.0
+major,CALL-SSTORE,1,1.0
+major,SSTORE-LOG,1,1.0
+major,CALL-LOG,1,1.0

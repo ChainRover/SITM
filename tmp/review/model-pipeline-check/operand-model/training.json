@@ -1,0 +1,14 @@
+{
+  "training": "local_mlm",
+  "seed": 42,
+  "epochs": 1,
+  "batch_size": 4,
+  "learning_rate": 5e-05,
+  "training_contracts": 4,
+  "optimizer_steps": 1,
+  "representation": "operand-bytes",
+  "train_manifest_sha256": "b0ebfc27f5235493abca8b3f53c9e4c98b9368459393497b0e5c46c702791fcf",
+  "training_code_sha256": "b447a9950b3a2b3f6874d9794c8a7b1ba2f498544a136b6a3758430feab477ab",
+  "training_contract_ids_sha256": "a3ab25cb57fe4853b452dc3532e9ed113df0a013e113dbeb24dccc57bdf8a96c",
+  "training_text_sha256": "3d8fee332f23f624101f5a9047a6619f287513575ff3ce1116cdbbd3d7198486"
+}

@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "representation": "opcode-only",
+  "max_length": 512,
+  "preprocessing": "solidity_cbor_metadata_stripped"
+}

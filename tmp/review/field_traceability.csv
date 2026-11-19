@@ -1,0 +1,5 @@
+field,total_events,known_events,pairs_with_known,total_pairs,event_rate,pair_rate
+store.base_slot,2,1,1,4,0.5,0.25
+store.pattern,2,1,1,4,0.5,0.25
+exc.opcode,2,2,2,4,1.0,0.5
+exc.condition,2,2,2,4,1.0,0.5
